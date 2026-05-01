@@ -369,7 +369,9 @@ more than `quality.out_of_family_sigma` MAD-sigma (default 5):
 - `quality_flags["out_of_family"]` lists the offending metrics.
 - `guiding_state` becomes `ALERTED`.
 - **No `G` command is issued for that frame.**
-- The GUI raises an `ALERT`-level banner and (optionally) an audible bell.
+- The GUI raises an `ALERT`-level banner and (subject to
+  `display.audio_alerts`) plays the warning sound exactly once on entry
+  into ALERTED — see §9 "Audio alert when guiding stops."
 - After `quality.auto_resume_in_family` consecutive in-family frames
   (default 3), state returns to `GUIDING` automatically. Otherwise the user
   must intervene.
@@ -594,6 +596,10 @@ Sections: `[loop]`, `[quality]`, `[reduction]`, `[files]`, `[tcs]`,
 - `detector.saturation_dn = 40000`
 - `display.image_stretch = "zscale"`, `display.theme_macos = "aqua"`,
   `display.theme_linux = "clam"`
+- `display.audio_alerts = true`,
+  `display.audio_alert_sound = "/System/Library/Sounds/Submarine.aiff"`
+  (overridable to any `.wav`/`.aiff` path, or `null` to use Tk's
+  `widget.bell()` only)
 
 A `[files] parent_data_dir` field is supported as the default starting
 location for the GUI's directory picker.
@@ -716,6 +722,41 @@ Three severity levels surfacing just below the status bar:
   self-recovering.
 - **ERROR** (red) — file watcher stalled / TCS disconnected / ridge fit
   failed. Requires user action.
+
+### Audio alert when guiding stops
+
+Whenever guiding effectively stops — i.e., the state machine transitions
+into one of the conditions below — the GUI plays a short, gentle warning
+sound:
+
+- **stale-frame timeout** (no new SUTRs within
+  `quality.stale_frame_timeout_s`) — guiding has stopped because the
+  Archon is no longer producing frames.
+- **TCS disconnect** — guiding can't proceed because commands are not
+  reaching the telescope.
+- **ridge auto-fit failure on a Save Reference attempt** — a calibration
+  step needed before guiding can start.
+- **out-of-family ALERT entry** — guiding has paused; commands are
+  suppressed pending self-recovery. Plays only on *entry* into the
+  ALERTED state, not for each rejected frame, and not again on auto-
+  resume back to GUIDING.
+
+The sound is intentionally subtle — a short ping or "blip", not a klaxon.
+The intent is "hey, look at the screen," not "drop everything." On
+macOS the default sound is the system **Submarine** (or **Tink**)
+(`/System/Library/Sounds/`); on Linux the default falls back to Tk's
+`widget.bell()` until a configured sound file is available. The full
+file path can be overridden in config (`display.audio_alert_sound`),
+including pointing at a custom `.wav`. Audio alerts can be disabled
+entirely with `display.audio_alerts = false` (default `true`).
+
+The audio is played from a non-blocking subprocess (`afplay` on macOS,
+`paplay`/`aplay` on Linux) so a slow audio system never stalls the GUI
+or the worker thread. If the subprocess fails, we log a `WARNING` and
+fall back to `widget.bell()`; the alert banner is unaffected.
+
+No audio is played for routine state changes (operator-driven STOP /
+PAUSE / Re-fit ridge), to avoid alert fatigue.
 
 ## 10. Logging
 
