@@ -71,6 +71,15 @@ Last updated: 2026-04-30
 19. **Lifecycle.** Does it ever change mid-night (e.g., new hot pixels found),
     or is it loaded once at startup?
 
+## Detector parameters (needed for Monte Carlo "Estimate K")
+
+20. **Gain.** Default placeholder is 4 e⁻/DN — what's the actual measured value
+    for the science detector? Per-quadrant or per-amplifier variation?
+21. **Read noise.** What's the RN per single non-destructive read, in
+    electrons? Needed to model the noise budget of K-sample averages.
+22. **Saturation / linearity.** At what DN level does the detector go
+    non-linear? Needed for sanity-checking guide-image pixel values.
+
 ## Operations
 
 15. **`guider_cmd_processing` enable/disable in operations.** Who toggles it,
