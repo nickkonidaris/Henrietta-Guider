@@ -191,25 +191,30 @@ across frames. The watcher enforces this and flags violations:
   - **Skipped SUTR** (`sutr > last_sutr + 1`): log a `WARNING`
     ("frame %d: SUTRs %d..%d missing"), discard the rolling-read buffer
     contents that would have used the missing reads, and resume building
-    K-window differences from the new SUTR forward.
-  - **Out-of-order SUTR** (`sutr ≤ last_sutr`): log a `WARNING`
-    ("frame %d: out-of-order SUTR %d after %d"), discard the file, do
-    not update the buffer.
+    K-window differences from the new SUTR forward. **Quiet** — log only,
+    no banner, no audio.
+  - **Out-of-order or repeated SUTR** (`sutr ≤ last_sutr`): log a
+    `WARNING` ("frame %d: out-of-order SUTR %d after %d"), discard the
+    file, do not update the buffer. **Audible**: WARN-level yellow
+    banner and the warning sound (`display.audio_alert_sound`). Guiding
+    continues. The system is new and these events should be rare; this
+    is a commissioning-grade alert so the operator knows the Archon
+    reordered something.
 - **Across frames.** Track the highest `frame_number` seen.
   - Expected case: `frame_number > last_frame_number`. Process; clear the
     rolling-read buffer (a new detector reset, see §4 "Frame boundary
     handling").
   - **Skipped frame numbers** (gap of >1): log `INFO`
-    ("frame %d → %d; %d frame(s) skipped"). This is a normal operational
-    occurrence (operator aborted exposures) — not an alert.
+    ("frame %d → %d; %d frame(s) skipped"). Normal (operator aborted
+    exposures) — not an alert.
   - **Backwards or repeated frame number** (`frame_number ≤ last`):
-    log a `WARNING`, discard the file. This indicates a serious Archon
-    or filesystem problem; it should never happen in normal operation.
+    log a `WARNING`, discard the file. **Audible**: same WARN banner +
+    warning sound as out-of-order SUTRs. Should never happen in normal
+    operation; serious if it does.
 
-These checks are quiet sanity nets: they don't trip the audio alert or
-banner ALERT/ERROR levels in the GUI, but every violation lands in the
-logs and (for non-discarded frames) in `quality_flags` on the
-`box_measurements` row so retrospective analysis can spot patterns.
+Every violation also lands in `quality_flags` on the `box_measurements`
+row (for non-discarded frames) so retrospective analysis can spot
+patterns even when the operator missed the live alert.
 
 ### Stale-frame watchdog
 
@@ -848,6 +853,13 @@ sound:
   Soft signal: just a brief system beep (Tk `widget.bell()`), no spoken
   phrase, no warning sound, no state change. See §4 "Target-switch
   detection."
+- **out-of-order or repeated SUTR / backwards frame number**. The
+  Archon reordered something — rare on a new system, but worth surfacing
+  audibly. Plays the warning sound + a yellow `WARN` banner ("frame %d:
+  out-of-order SUTR %d after %d"). No spoken phrase. Guiding continues
+  (the file is discarded; the next valid file is processed normally).
+  *Skipped* SUTRs and *skipped* frame numbers do not trigger audio —
+  see §4 "Sequential-order sanity checks."
 - **TCS disconnect** — guiding can't proceed because commands are not
   reaching the telescope.
 - **ridge auto-fit failure on a Save Reference attempt** — a calibration
