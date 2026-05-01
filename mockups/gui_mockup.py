@@ -92,6 +92,20 @@ def synth_timeseries(n: int = 240, rng: np.random.Generator | None = None):
     return t, dx, dy, fwhm, flux, flux_cmp, sky, xcor
 
 
+def synth_snr_per_pixel(rng: np.random.Generator | None = None,
+                        gain_e_per_dn: float = 4.0) -> np.ndarray:
+    """Synthetic per-pixel SNR distribution for the science stamp:
+    a low-SNR sky pedestal plus a high-SNR trace ridge."""
+    if rng is None:
+        rng = np.random.default_rng(11)
+    # ~70k pixels in the stamp. Most are sky-dominated (low signal),
+    # a few thousand sit on the trace (high signal).
+    sky_DN   = np.clip(rng.normal(60, 12, 60000), 1, None)
+    trace_DN = np.clip(rng.normal(2400, 800, 8000), 1, None)
+    all_DN   = np.concatenate([sky_DN, trace_DN])
+    return np.sqrt(all_DN * gain_e_per_dn)
+
+
 # ---------------------------------------------------------------------------
 # Figure layout
 # ---------------------------------------------------------------------------
@@ -99,16 +113,19 @@ def synth_timeseries(n: int = 240, rng: np.random.Generator | None = None):
 def render():
     img = synth_image()
     t, dx, dy, fwhm, flux, flux_cmp, sky, xcor = synth_timeseries()
+    snr = synth_snr_per_pixel()
 
-    fig = plt.figure(figsize=(15.5, 12.0), facecolor="#ECECEC")
+    fig = plt.figure(figsize=(15.5, 14.5), facecolor="#ECECEC")
     gs = GridSpec(
-        nrows=9,
+        nrows=10,
         ncols=2,
-        height_ratios=[0.6, 4.5, 4.5, 0.5, 0.92, 0.92, 0.92, 0.92, 0.92],
+        height_ratios=[0.6, 4.5, 4.5, 0.5,
+                       0.85, 0.85, 0.85, 0.85, 0.85,  # 5 time-series rows
+                       2.20],                           # SNR histogram (taller)
         width_ratios=[3.4, 2.2],
-        hspace=0.45,
+        hspace=0.50,
         wspace=0.10,
-        left=0.045, right=0.985, top=0.965, bottom=0.05,
+        left=0.045, right=0.985, top=0.965, bottom=0.055,
     )
 
     # ---- status bar (top) ---------------------------------------------------
@@ -250,14 +267,17 @@ def render():
 
     # Template section
     section(ax_ctrl, 0.575, "Template")
-    ax_ctrl.text(0.04, 0.530, "current: hen0042.fits",
+    ax_ctrl.text(0.04, 0.530, "current: hen0042.fits  (fixed)",
                  transform=ax_ctrl.transAxes,
                  va="center", ha="left", fontsize=9, color="#333")
-    ax_ctrl.text(0.04, 0.495, "auto-refreshes on each new henNNNN.fits",
+    # Unchecked checkbox + label
+    ax_ctrl.add_patch(mpatches.Rectangle(
+        (0.04, 0.482), 0.022, 0.030, transform=ax_ctrl.transAxes,
+        facecolor="white", edgecolor="#666", lw=0.7))
+    ax_ctrl.text(0.075, 0.497, "Auto-refresh on new henNNNN.fits",
                  transform=ax_ctrl.transAxes,
-                 va="center", ha="left", fontsize=8.5, color="#777",
-                 fontstyle="italic")
-    button(ax_ctrl, 0.04, 0.440, 0.92, 0.040, "Build Template", primary=True)
+                 va="center", ha="left", fontsize=8.8, color="#444")
+    button(ax_ctrl, 0.04, 0.430, 0.92, 0.040, "Build Template", primary=True)
 
     # Loop section
     section(ax_ctrl, 0.395, "Loop")
@@ -326,6 +346,30 @@ def render():
             ax.set_xlabel("time (min)", fontsize=8.5)
         else:
             ax.set_xticklabels([])
+
+    # ---- per-pixel SNR histogram (last row, full width) --------------------
+    ax_hist = fig.add_subplot(gs[9, :])
+    ax_hist.set_facecolor("#FFFFFF")
+    for s in ax_hist.spines.values():
+        s.set_edgecolor("#999"); s.set_linewidth(0.5)
+    bins = np.linspace(0, snr.max() * 1.05, 80)
+    ax_hist.hist(snr, bins=bins, color="#4c78a8", edgecolor="#274860",
+                 linewidth=0.4)
+    ax_hist.axvline(1.0,  color="#888", lw=0.7, ls=":")
+    ax_hist.axvline(5.0,  color="#888", lw=0.7, ls=":")
+    ax_hist.text(1.0,  ax_hist.get_ylim()[1] * 0.92, " SNR=1",
+                 color="#666", fontsize=7.5, va="top")
+    ax_hist.text(5.0,  ax_hist.get_ylim()[1] * 0.92, " SNR=5",
+                 color="#666", fontsize=7.5, va="top")
+    ax_hist.set_xlabel(r"per-pixel SNR  =  $\sqrt{\mathrm{signal\_DN}\,\cdot\,\mathrm{gain}}$",
+                       fontsize=8.5)
+    ax_hist.set_ylabel("pixels", fontsize=8.5)
+    ax_hist.set_title(
+        "Per-pixel SNR histogram — current frame, science stamp "
+        "(median 81.4,  10th-percentile 49.0)",
+        fontsize=9, loc="left", color="#222", pad=4,
+    )
+    ax_hist.tick_params(labelsize=7.5)
 
     fig.suptitle(
         "Henrietta autoguider — operator GUI mockup (synthetic data)",

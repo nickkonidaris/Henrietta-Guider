@@ -395,21 +395,31 @@ science stamp (and optionally the comparison stamp) from that file,
 applies the BPM, and runs the local sky subtraction described above.
 The resulting bg-subtracted, masked stamp **is** the template `T(x, y)`.
 
-**Sliding template — single most-recent good frame.** Each
-`henNNNN.fits` is already a slope-fit across all that integration's
+**Template lifecycle — fixed by default; auto-refresh is opt-in.**
+Each `henNNNN.fits` is already a slope-fit across all that integration's
 SUTRs, so on its own it is a high-SNR representation of the trace. The
-autoguider keeps **one** template at a time: the most recent
-`henNNNN.fits` for which the build succeeded (no read error, enough
-unmasked pixels in the stamp, non-zero variance after sky subtraction).
-As new `henNNNN.fits` files arrive, each is offered for promotion; on
-success it replaces the active template, and on failure the previous
-template continues in use. This gives drift adaptation across a long
-night without any averaging machinery to manage.
+autoguider keeps **one** template at a time.
 
-When the user clicks **"Build Template"**, the most recent `henNNNN.fits`
-is taken (failing the request if none has arrived yet on the current
-target). After that click guiding can start immediately on that
-template; subsequent arrivals continue to refresh it automatically.
+When the user clicks **"Build Template"**, the most recent
+`henNNNN.fits` is taken (failing the request if none has arrived yet on
+the current target). The build is validated (no read error, enough
+unmasked pixels in the stamp, non-zero variance after sky subtraction).
+On success that frame becomes the active template and the GUI moves to
+`REFERENCE_SET`; on failure an `ERROR` banner appears and the user
+stays in `REFERENCE_PENDING`.
+
+By default the template **stays fixed** for the rest of the session —
+exactly the frame the user pointed at, until they explicitly click
+Build Template again or the state machine resets it (stale-frame
+timeout, target switch, watch-dir change).
+
+Setting `reduction.auto_refresh_template = true` (or toggling the
+**Auto-refresh** checkbox in the Template panel) enables an opt-in
+behaviour: each subsequent `henNNNN.fits` is offered for promotion;
+on a successful build it replaces the active template, and on a
+failure the previous template stays in use. This trades a fixed
+reference for one that follows slow shape evolution (water vapour,
+airmass, thermal drift, flexure) on long sequences.
 
 The template is held in memory only and is **not** persisted across
 restarts — it must be re-built each time the autoguider starts.
@@ -474,6 +484,21 @@ Per-frame quantities recorded for analysis:
 - `sky_background_adu` — median of per-row sky pedestals.
 - `template_frame_number` — which `henNNNN.fits` produced the active
   template, for retrospective traceability.
+- **Per-pixel shot-noise-limited SNR.** Using the cumulative signal in
+  the current frame (i.e., `current_read − reset_read`, not the K-window
+  diff) without sky subtraction:
+
+  ```
+  signal_DN     = current_read − reset_read     # per pixel, full frame so far
+  SNR_per_px    = sqrt(signal_DN × gain_e_per_DN)
+  ```
+
+  This is the per-pixel SNR you'd have under shot-noise-only assumption.
+  It's a snapshot per guide image; the stamp's distribution is shown as
+  a live histogram in the GUI (§9). Two summary stats land in
+  `stamp_measurements` for retrospective trend analysis:
+  `signal_snr_median` and `signal_snr_p10` (10th-percentile across
+  unmasked stamp pixels).
 
 `(dx_px, dy_px)` are converted to sky offsets (§6).
 
@@ -682,6 +707,8 @@ CREATE TABLE stamp_measurements (
     trace_fwhm_x_px       REAL,
     trace_flux_adu        REAL,
     sky_background_adu    REAL,
+    signal_snr_median     REAL,               -- median sqrt(DN·gain) over unmasked stamp pixels
+    signal_snr_p10        REAL,               -- 10th-percentile of the same
     quality_flags         TEXT,               -- JSON
     PRIMARY KEY (frame_number, sutr_number, stamp_id),
     FOREIGN KEY (frame_number, sutr_number)
@@ -724,6 +751,11 @@ Sections: `[loop]`, `[quality]`, `[reduction]`, `[files]`, `[tcs]`,
 - `reduction.stamp_y_lo = 600`, `reduction.stamp_y_hi = 1980`
   (filter cutoff to filter cutoff; tune per detector / filter)
 - `reduction.xcor_search_radius_px = 12`
+- `reduction.auto_refresh_template = false`
+  (when `true`, each new `henNNNN.fits` that builds successfully
+  replaces the active template; useful for hours-long sequences where
+  slow shape evolution matters. Default off — the template stays fixed
+  until the user clicks Build Template again.)
 - `reduction.template_min_peak_value = 0.0`
   (minimum acceptable xcor peak value; below this the frame is flagged
   in `quality_flags`. Default 0 = no threshold; tune empirically.)
@@ -775,7 +807,9 @@ Single Tk window, layout:
 │                          │    y_lo:        __________ px             │
 │                          │    y_hi:        __________ px             │
 │                          │                                           │
-│                          │  Template:  hen0042.fits  (auto-refresh)  │
+│                          │  Template:  hen0042.fits                  │
+│                          │             [ ] Auto-refresh on new       │
+│                          │                 henNNNN.fits              │
 │                          │             [Build Template]              │
 │                          │                                           │
 │                          │  Loop:     [START]  [STOP]  [PAUSE]       │
@@ -788,6 +822,10 @@ Single Tk window, layout:
 │     sky_background_adu                                               │
 │     xcor_peak_value      — drops on cloud / template mismatch        │
 │     commands sent (RA, Dec)                                          │
+├──────────────────────────────────────────────────────────────────────┤
+│   Per-pixel SNR histogram (current frame, science stamp):            │
+│     X = √(signal_DN · gain),  Y = pixel count                        │
+│     vertical guides at SNR = 1, 5; redraws on every guide image      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
