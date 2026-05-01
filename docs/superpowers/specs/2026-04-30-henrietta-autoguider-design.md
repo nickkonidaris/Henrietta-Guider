@@ -215,14 +215,56 @@ logs and (for non-discarded frames) in `quality_flags` on the
 
 A timer in the worker thread tracks elapsed time since the last accepted
 guide image. If it exceeds `quality.stale_frame_timeout_s` (default 30 s),
-an `ERROR`-level alert "Guiding has stopped — no frames received" is
-raised and guiding is paused until frames resume.
+guiding **stops** — not pauses — because a 30-second gap likely means
+something operationally significant has happened (target slewed, Archon
+restarted, observer paused the run, target swap). Auto-resuming with a
+stale reference image after that long is unsafe.
+
+Concretely:
+
+- An `ERROR`-level alert is raised: "Guiding has stopped — no frames
+  received for N s."
+- The audio alert (§9) plays.
+- The state machine transitions from `GUIDING` (or `ALERTED`) directly
+  to `REFERENCE_PENDING`. Box geometry, ridge coefficients, and targets
+  are preserved (they are detector-frame and durable), but the in-memory
+  reference image and reference 1-D profile are discarded, the rolling
+  SUTR buffer is cleared, and the running statistics for out-of-family
+  detection are reset. The observer must click "Save Reference" on a
+  fresh frame before guiding can re-engage.
 
 The timer is **gated**: it only starts running once at least one guide
 image has been accepted, and it is **reset** whenever the watch directory
 is changed and on the first accepted guide image after a frame-number
 boundary (so the inevitable warm-up delay of ~`2K` reads on a new target
 does not falsely trip the alert).
+
+### Target-switch detection
+
+Even if frames keep arriving, the operator may swap targets without
+stopping the guider. Two signals are checked on every accepted frame:
+
+- **Pointing jump.** Read RA, Dec from the FITS header. Compare to the
+  previous accepted frame's values. If
+  `√((ΔRA · cos(Dec))² + ΔDec²) > quality.target_switch_arcsec_threshold`
+  (default 20″), flag a probable target switch.
+- **Object name change.** Read the `OBJECT` keyword (exact keyword TBC
+  with William). If it differs from the previous frame's, flag a probable
+  target switch.
+
+On flag, regardless of which signal triggered:
+
+- An `ERROR`-level alert is raised: "Target change possible — pointing
+  jumped %.1f″" or "Target change possible — OBJECT %s → %s."
+- The audio alert plays the **spoken warning** "target change possible"
+  in addition to the normal warning sound (see §9).
+- The state machine transitions to `REFERENCE_PENDING` (same as the
+  stale-frame stop above), discarding the reference image and resetting
+  running statistics.
+
+The first frame after a fresh `Save Reference` is treated as the new
+"previous" — no comparison is made, so the very first frame on a new
+target never trips this check.
 
 ### SUTR difference model
 
@@ -624,6 +666,7 @@ Sections: `[loop]`, `[quality]`, `[reduction]`, `[files]`, `[tcs]`,
 - `quality.out_of_family_sigma = 5.0`
 - `quality.auto_resume_in_family = 3`
 - `quality.stale_frame_timeout_s = 30.0`
+- `quality.target_switch_arcsec_threshold = 20.0`
 - `reduction.K = 1`, `reduction.stride = 1`, `reduction.ridge_degree = 1`
 - `reduction.min_ridge_rows = 20`
 - `reduction.max_ridge_residual_px = 0.5`
@@ -638,6 +681,10 @@ Sections: `[loop]`, `[quality]`, `[reduction]`, `[files]`, `[tcs]`,
   `display.audio_alert_sound = "/System/Library/Sounds/Submarine.aiff"`
   (overridable to any `.wav`/`.aiff` path, or `null` to use Tk's
   `widget.bell()` only)
+- `display.audio_speak_alerts = true` — when an event has a spoken
+  phrase associated with it (currently only target-switch detection),
+  speak it via the OS speech synthesiser (`say`/`espeak`). Set `false`
+  to keep only the warning sound.
 
 A `[files] parent_data_dir` field is supported as the default starting
 location for the GUI's directory picker.
@@ -770,6 +817,12 @@ sound:
 - **stale-frame timeout** (no new SUTRs within
   `quality.stale_frame_timeout_s`) — guiding has stopped because the
   Archon is no longer producing frames.
+- **target switch** — pointing or `OBJECT` jumped (see §4 "Target-switch
+  detection"). In addition to the warning sound, a **spoken phrase**
+  ("target change possible") is played via the OS speech synthesiser
+  (`say` on macOS, `espeak` or equivalent on Linux). Spoken alerts can
+  be disabled with `display.audio_speak_alerts = false` (default `true`)
+  while still keeping the warning sound.
 - **TCS disconnect** — guiding can't proceed because commands are not
   reaching the telescope.
 - **ridge auto-fit failure on a Save Reference attempt** — a calibration
@@ -790,8 +843,9 @@ entirely with `display.audio_alerts = false` (default `true`).
 
 The audio is played from a non-blocking subprocess (`afplay` on macOS,
 `paplay`/`aplay` on Linux) so a slow audio system never stalls the GUI
-or the worker thread. If the subprocess fails, we log a `WARNING` and
-fall back to `widget.bell()`; the alert banner is unaffected.
+or the worker thread. The same applies to the speech subprocess (`say`
+or `espeak`). If a subprocess fails, we log a `WARNING` and fall back to
+`widget.bell()`; the alert banner is unaffected.
 
 No audio is played for routine state changes (operator-driven STOP /
 PAUSE / Re-fit ridge), to avoid alert fatigue.

@@ -83,6 +83,16 @@ Last updated: 2026-04-30
     discard the file with a warning; skipped SUTRs = lose one K-window
     diff and continue). If the Archon ever legitimately writes
     out-of-order or skips numbers, we need to know.
+13. **Target name keyword.** Which FITS header keyword holds the target
+    / object name (`OBJECT`, `TARGNAME`, `OBJ-NAME`, …)? Used by the
+    autoguider's target-switch detector to spot mid-night target swaps
+    via OBJECT-name change.
+14. **RA / Dec keywords for header pointing.** Used by both the
+    measurement-archive (HA/Dec binning) and the target-switch
+    detection (`>20"` move). Keywords used (`RA`, `DEC`, or `RA-OBJ`,
+    `DEC-OBJ`, or `TELRA`, `TELDEC`)? Are they decimal degrees, decimal
+    hours, or sexagesimal strings? Are they at start-of-exposure,
+    middle, or written when?
 
 ## Instrument geometry
 
