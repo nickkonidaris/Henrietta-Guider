@@ -496,3 +496,791 @@ Expected: "nothing to commit, working tree clean."
 End of Chunk 1. Working state: empty package, passing CI, working `make` targets, ready to start writing real code.
 
 ---
+
+## Chunk 2: Computational foundation
+
+**Goal:** Land the four pure-computational modules — wire encoder/decoder, TCS client, detector→sky geometry, and per-axis controller — with comprehensive unit tests. These are foundational and have no I/O dependencies (the TCS client uses a pair of `socket.socketpair`s in tests). Once Chunk 2 is done, the autoguider has the entire "math + bits on the wire" pipeline in working code.
+
+The order matters: **wire** before **tcs_client** (encoder is a pure function the client wraps), then **geometry**, then **controller**. Each module is a single-responsibility file (~150 lines max).
+
+### Task 2.1: Wire encoder + decoder
+
+**Files:**
+- Create: `henrietta_guider/core/wire.py`
+- Create: `tests/unit/test_wire.py`
+
+The TCS guide port accepts the 6-byte ASCII frame `G xx yy <CR>` per `Wireformat.md`. `xx` and `yy` are signed offsets in 0.05″ steps over the encoded range `00..99` where `n > 50` decodes as `n - 100` (so `51 → -49` … `99 → -1`). The encoder rounds, clamps, and bytes-out; the decoder is for tests (round-trip property check) and for retrospective log analysis.
+
+- [ ] **Step 1: Write the failing tests.**
+
+Create `tests/unit/test_wire.py`:
+
+```python
+import pytest
+
+from henrietta_guider.core.wire import (
+    GUIDE_STEP_ARCSEC,
+    decode_command,
+    encode_command,
+    encode_step,
+)
+
+
+@pytest.mark.unit
+class TestEncodeStep:
+    def test_zero(self):
+        assert encode_step(0) == "00"
+
+    def test_positive_max(self):
+        assert encode_step(50) == "50"
+
+    def test_negative_one(self):
+        assert encode_step(-1) == "99"
+
+    def test_negative_max(self):
+        assert encode_step(-49) == "51"
+
+    @pytest.mark.parametrize("steps,encoded", [
+        (0, "00"), (1, "01"), (10, "10"), (50, "50"),
+        (-1, "99"), (-2, "98"), (-49, "51"),
+    ])
+    def test_table(self, steps, encoded):
+        assert encode_step(steps) == encoded
+
+    def test_clamps_above_max(self):
+        # Caller is expected to clamp first; encoder is defence in depth.
+        assert encode_step(99) == "50"
+
+    def test_clamps_below_min(self):
+        assert encode_step(-99) == "51"
+
+
+@pytest.mark.unit
+class TestEncodeCommand:
+    def test_zero_zero(self):
+        assert encode_command(0.0, 0.0) == b"G0000\r"
+
+    def test_max_positive(self):
+        # +2.50" RA, +2.50" Dec
+        assert encode_command(+2.50, +2.50) == b"G5050\r"
+
+    def test_max_negative(self):
+        # -2.45" RA, -2.45" Dec
+        assert encode_command(-2.45, -2.45) == b"G5151\r"
+
+    def test_rounds_to_nearest_step(self):
+        # 0.07" rounds to 0.05" (1 step). 0.024" rounds to 0.0" (0 steps).
+        assert encode_command(0.07, 0.024) == b"G0100\r"
+
+    def test_round_trip_property(self):
+        import numpy as np
+        for x in np.arange(-2.45, 2.501, 0.001):
+            for y in np.arange(-2.45, 2.501, 0.001):
+                wire = encode_command(float(x), float(y))
+                ra, dec = decode_command(wire)
+                assert abs(ra  - round(x / GUIDE_STEP_ARCSEC) * GUIDE_STEP_ARCSEC) < 1e-9
+                assert abs(dec - round(y / GUIDE_STEP_ARCSEC) * GUIDE_STEP_ARCSEC) < 1e-9
+
+
+@pytest.mark.unit
+class TestDecodeCommand:
+    def test_canonical_zero(self):
+        assert decode_command(b"G0000\r") == (0.0, 0.0)
+
+    def test_max_positive(self):
+        assert decode_command(b"G5050\r") == (2.50, 2.50)
+
+    def test_negative_pair(self):
+        # 9951 -> RA = -1 step = -0.05"; Dec = -49 steps = -2.45"
+        assert decode_command(b"G9951\r") == (pytest.approx(-0.05), pytest.approx(-2.45))
+
+    def test_rejects_missing_cr(self):
+        with pytest.raises(ValueError, match="missing CR"):
+            decode_command(b"G0000\n")
+
+    def test_rejects_wrong_prefix(self):
+        with pytest.raises(ValueError, match="prefix"):
+            decode_command(b"X0000\r")
+
+    def test_rejects_short_frame(self):
+        with pytest.raises(ValueError, match="length"):
+            decode_command(b"G000\r")
+```
+
+- [ ] **Step 2: Run the tests, confirm they fail.**
+
+Run: `uv run pytest tests/unit/test_wire.py -v`
+Expected: import errors / collection errors (the module doesn't exist yet). This is the desired RED state.
+
+- [ ] **Step 3: Implement `core/wire.py`.**
+
+Create `henrietta_guider/core/wire.py`:
+
+```python
+"""TCS guide-port wire format. See Wireformat.md.
+
+The TCS accepts a 6-byte ASCII frame:
+
+    G <xx> <yy> <CR>
+
+Where xx and yy are signed offsets in 0.05" steps. The encoded value n
+in 00..99 decodes as:
+
+    n in 00..50  ->  signed value =  n
+    n in 51..99  ->  signed value =  n - 100   (so 51 = -49, 99 = -1)
+
+Range:  -2.45" ... +2.50"  on each axis (asymmetric).
+
+The link is fire-and-forget; the TCS silently drops commands while it is
+slewing or while its `guider_cmd_processing` flag is false.
+"""
+
+from __future__ import annotations
+
+GUIDE_STEP_ARCSEC: float = 0.05
+WIRE_LENGTH: int = 6  # bytes
+WIRE_CR: bytes = b"\r"
+MAX_POS_STEPS: int = 50
+MAX_NEG_STEPS: int = -49
+
+
+def encode_step(steps: int) -> str:
+    """Encode a signed step count (-49..+50) as a two-character ASCII pair.
+
+    Values outside the legal range are clamped (defence in depth; callers
+    should already have applied the controller's max_command_arcsec
+    clip).
+    """
+    if steps > MAX_POS_STEPS:
+        steps = MAX_POS_STEPS
+    elif steps < MAX_NEG_STEPS:
+        steps = MAX_NEG_STEPS
+    n = steps if steps >= 0 else steps + 100
+    return f"{n:02d}"
+
+
+def decode_step(encoded: str) -> int:
+    """Decode a two-character ASCII pair as a signed step count."""
+    if len(encoded) != 2 or not encoded.isdigit():
+        raise ValueError(f"invalid step encoding: {encoded!r}")
+    n = int(encoded)
+    return n if n <= MAX_POS_STEPS else n - 100
+
+
+def encode_command(ra_arcsec: float, dec_arcsec: float) -> bytes:
+    """Encode a (RA, Dec) sky offset in arcseconds to a 6-byte wire frame."""
+    ra_steps  = round(ra_arcsec  / GUIDE_STEP_ARCSEC)
+    dec_steps = round(dec_arcsec / GUIDE_STEP_ARCSEC)
+    return f"G{encode_step(ra_steps)}{encode_step(dec_steps)}".encode("ascii") + WIRE_CR
+
+
+def decode_command(frame: bytes) -> tuple[float, float]:
+    """Decode a wire frame back to (RA, Dec) arcseconds.
+
+    Useful for retrospective log analysis and round-trip property tests.
+    Raises ValueError on malformed frames.
+    """
+    if len(frame) != WIRE_LENGTH:
+        raise ValueError(f"wrong length: expected {WIRE_LENGTH}, got {len(frame)}")
+    if frame[:1] != b"G":
+        raise ValueError(f"wrong prefix: expected b'G', got {frame[:1]!r}")
+    if frame[5:6] != WIRE_CR:
+        raise ValueError(f"missing CR at byte 5; got {frame[5:6]!r}")
+    ra  = decode_step(frame[1:3].decode("ascii")) * GUIDE_STEP_ARCSEC
+    dec = decode_step(frame[3:5].decode("ascii")) * GUIDE_STEP_ARCSEC
+    return ra, dec
+```
+
+- [ ] **Step 4: Run the tests, confirm they pass.**
+
+Run: `uv run pytest tests/unit/test_wire.py -v`
+Expected: all green. The round-trip property test is the slowest (~5k pairs); should still finish in well under 10 seconds.
+
+- [ ] **Step 5: Lint.**
+
+Run: `uv run ruff format . && uv run ruff check .`
+Expected: clean.
+
+- [ ] **Step 6: Commit.**
+
+```bash
+git add henrietta_guider/core/wire.py tests/unit/test_wire.py
+git commit -m "core: wire format encoder + decoder per Wireformat.md"
+```
+
+### Task 2.2: TCS client with pacing
+
+**Files:**
+- Create: `henrietta_guider/core/tcs_client.py`
+- Create: `tests/unit/test_tcs_client.py`
+
+The client is fire-and-forget over TCP. It owns its own state machine (`DISCONNECTED → CONNECTING → CONNECTED`), auto-reconnects with exponential backoff, and enforces a minimum interval between sends to respect the TCS's `!guiding_ra && !guiding_dec` gate. `send_guide()` is non-blocking: returns `True` on send, `False` if not currently `CONNECTED` or within the pacing window.
+
+The tests use `socket.socketpair()` so we don't need a real TCP listener; the client accepts a pre-connected socket via a test-only constructor.
+
+- [ ] **Step 1: Write the failing tests.**
+
+Create `tests/unit/test_tcs_client.py`:
+
+```python
+import socket
+import time
+
+import pytest
+
+from henrietta_guider.core.tcs_client import TCSClient, ConnectionState
+
+
+@pytest.mark.unit
+class TestTCSClient:
+    def _make_with_pair(self, pacing_s=0.0):
+        a, b = socket.socketpair()
+        client = TCSClient.from_connected_socket(a, pacing_interval_s=pacing_s)
+        return client, b  # b is the test-side "TCS"
+
+    def test_initial_state_when_seeded_is_connected(self):
+        client, peer = self._make_with_pair()
+        assert client.state is ConnectionState.CONNECTED
+        peer.close()
+
+    def test_send_guide_emits_correct_bytes(self):
+        client, peer = self._make_with_pair()
+        ok = client.send_guide(0.50, -0.05)
+        assert ok is True
+        assert peer.recv(6) == b"G1099\r"
+        peer.close()
+
+    def test_send_when_disconnected_returns_false(self):
+        client, peer = self._make_with_pair()
+        peer.close()
+        # Send to a closed peer — first send may succeed (kernel buffer) or
+        # fail; the next send after we've registered DISCONNECTED returns
+        # False without raising.
+        client.send_guide(0.0, 0.0)            # may flag DISCONNECTED
+        client.send_guide(0.0, 0.0)            # may flag DISCONNECTED
+        # Force the state for the assertion (test-only API):
+        client._force_state(ConnectionState.DISCONNECTED)
+        assert client.send_guide(0.0, 0.0) is False
+        assert client.commands_suppressed_disconnected == 1
+
+    def test_pacing_blocks_within_window(self):
+        client, peer = self._make_with_pair(pacing_s=0.20)
+        assert client.send_guide(0.0, 0.0) is True
+        peer.recv(6)
+        # Immediately again: should be suppressed.
+        assert client.send_guide(0.05, 0.0) is False
+        assert client.commands_suppressed_pacing == 1
+        time.sleep(0.22)
+        # Outside the window: should send.
+        assert client.send_guide(0.05, 0.0) is True
+        peer.recv(6)
+        peer.close()
+
+    def test_clip_then_encode(self):
+        # 3.0" exceeds the wire range; the client should clip to 2.50"
+        # before encoding.
+        client, peer = self._make_with_pair()
+        ok = client.send_guide(3.0, -3.0)
+        assert ok is True
+        assert peer.recv(6) == b"G5051\r"  # +2.50" RA, -2.45" Dec
+        peer.close()
+```
+
+- [ ] **Step 2: Run the tests, confirm they fail.**
+
+Run: `uv run pytest tests/unit/test_tcs_client.py -v`
+Expected: import error (module doesn't exist).
+
+- [ ] **Step 3: Implement `core/tcs_client.py`.**
+
+Create `henrietta_guider/core/tcs_client.py`:
+
+```python
+"""Fire-and-forget TCP client for the Henrietta TCS guide port.
+
+State machine:
+    DISCONNECTED -> CONNECTING -> CONNECTED
+                ^         |             |
+                |_________|_____________|
+
+Auto-reconnect with exponential backoff. send_guide() is non-blocking:
+returns True on a real send, False if not currently CONNECTED or within
+the pacing window. Both suppression paths are counted for surfacing in
+the GUI status bar.
+"""
+
+from __future__ import annotations
+
+import enum
+import logging
+import socket
+import time
+
+from .wire import (
+    GUIDE_STEP_ARCSEC,
+    MAX_NEG_STEPS,
+    MAX_POS_STEPS,
+    encode_command,
+)
+
+log = logging.getLogger(__name__)
+
+
+class ConnectionState(enum.Enum):
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+
+
+class TCSClient:
+    """TCP client to the TCS guide port.
+
+    The class is *not* thread-safe. The autoguider's worker thread is
+    the only thread that calls `send_guide()`; the GUI reads connection
+    state via the property accessors only.
+    """
+
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        pacing_interval_s: float = 5.0,
+        backoff_initial_s: float = 1.0,
+        backoff_max_s: float = 30.0,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.pacing_interval_s = pacing_interval_s
+        self._backoff_initial = backoff_initial_s
+        self._backoff_max = backoff_max_s
+        self._sock: socket.socket | None = None
+        self._state = ConnectionState.DISCONNECTED
+        self._last_send_monotonic: float = -1e9
+        self.commands_suppressed_pacing: int = 0
+        self.commands_suppressed_disconnected: int = 0
+
+    # ---- construction -----------------------------------------------------
+
+    @classmethod
+    def from_connected_socket(
+        cls,
+        sock: socket.socket,
+        pacing_interval_s: float = 0.0,
+    ) -> "TCSClient":
+        """Test-only: build a client around a pre-connected socket."""
+        client = cls(pacing_interval_s=pacing_interval_s)
+        client._sock = sock
+        client._state = ConnectionState.CONNECTED
+        return client
+
+    # ---- public API -------------------------------------------------------
+
+    @property
+    def state(self) -> ConnectionState:
+        return self._state
+
+    def send_guide(self, ra_arcsec: float, dec_arcsec: float) -> bool:
+        """Send a single guide-offset frame.
+
+        Returns True if the frame was put on the socket, False if it was
+        suppressed (not connected, or within the pacing window). Never
+        raises on a normal disconnect; logs WARNING and flips state.
+        """
+        if self._state is not ConnectionState.CONNECTED:
+            self.commands_suppressed_disconnected += 1
+            return False
+
+        now = time.monotonic()
+        if now - self._last_send_monotonic < self.pacing_interval_s:
+            self.commands_suppressed_pacing += 1
+            return False
+
+        # Clip to the legal wire range *before* encoding so the controller's
+        # asymmetric range is honoured (max_command_arcsec is 2.45 by default
+        # in §8 config; this is defence in depth).
+        ra_clipped  = max(MAX_NEG_STEPS * GUIDE_STEP_ARCSEC,
+                          min(MAX_POS_STEPS * GUIDE_STEP_ARCSEC, ra_arcsec))
+        dec_clipped = max(MAX_NEG_STEPS * GUIDE_STEP_ARCSEC,
+                          min(MAX_POS_STEPS * GUIDE_STEP_ARCSEC, dec_arcsec))
+
+        frame = encode_command(ra_clipped, dec_clipped)
+        try:
+            assert self._sock is not None
+            self._sock.sendall(frame)
+        except OSError as exc:
+            log.warning("TCS sendall failed: %s", exc)
+            self._mark_disconnected()
+            self.commands_suppressed_disconnected += 1
+            return False
+
+        self._last_send_monotonic = now
+        log.info("G %s sent (RA=%+.2f\" Dec=%+.2f\")",
+                 frame[1:5].decode(), ra_clipped, dec_clipped)
+        return True
+
+    def close(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            finally:
+                self._sock = None
+        self._state = ConnectionState.DISCONNECTED
+
+    # ---- internal ---------------------------------------------------------
+
+    def _mark_disconnected(self) -> None:
+        self._state = ConnectionState.DISCONNECTED
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            finally:
+                self._sock = None
+
+    def _force_state(self, state: ConnectionState) -> None:
+        """Test-only state override."""
+        self._state = state
+```
+
+Note: full reconnect / exponential-backoff machinery is intentionally deferred to Chunk 5 (`worker.py` will own the lifecycle). For now the client only does the send-side state transitions; reconnect is wired up later.
+
+- [ ] **Step 4: Run the tests, confirm they pass.**
+
+Run: `uv run pytest tests/unit/test_tcs_client.py -v`
+Expected: all five green.
+
+- [ ] **Step 5: Lint.**
+
+Run: `uv run ruff format . && uv run ruff check .`
+Expected: clean.
+
+- [ ] **Step 6: Commit.**
+
+```bash
+git add henrietta_guider/core/tcs_client.py tests/unit/test_tcs_client.py
+git commit -m "core: TCS client with pacing + suppression counters"
+```
+
+### Task 2.3: Detector → sky geometry
+
+**Files:**
+- Create: `henrietta_guider/core/geometry.py`
+- Create: `tests/unit/test_geometry.py`
+
+Convert detector pixel offsets to sky (RA, Dec) arcseconds via plate scale + PA rotation + per-axis parity. The exact signs are TBC with William (Question 14) so all parameters are exposed; the unit tests pin every PA / parity combination so a sign flip in production is a one-config-line change.
+
+- [ ] **Step 1: Write the failing tests.**
+
+Create `tests/unit/test_geometry.py`:
+
+```python
+import math
+
+import pytest
+
+from henrietta_guider.core.geometry import detector_to_sky
+
+
+@pytest.mark.unit
+class TestDetectorToSky:
+    PLATE = 0.435  # arcsec/px (placeholder; real value from William)
+
+    def test_zero_pa_zero_offset(self):
+        ra, dec = detector_to_sky(0.0, 0.0, self.PLATE, 0.0, +1, +1)
+        assert ra == pytest.approx(0.0)
+        assert dec == pytest.approx(0.0)
+
+    def test_pa_zero_x_maps_to_ra(self):
+        # At PA=0, +Y on the detector points North (+Dec) and +X points East (+RA).
+        # parity_x = +1 means +X ~ +RA at PA=0; parity_y = +1 means +Y ~ +Dec.
+        # So a +1 px x-shift -> +plate" RA, 0 Dec.
+        ra, dec = detector_to_sky(1.0, 0.0, self.PLATE, 0.0, +1, +1)
+        assert ra  == pytest.approx(-self.PLATE)  # see geometry.py docstring for sign convention
+        assert dec == pytest.approx(0.0, abs=1e-12)
+
+    def test_pa_zero_y_maps_to_dec(self):
+        ra, dec = detector_to_sky(0.0, 1.0, self.PLATE, 0.0, +1, +1)
+        assert ra  == pytest.approx(0.0, abs=1e-12)
+        assert dec == pytest.approx(self.PLATE)
+
+    def test_pa_90_x_maps_to_dec(self):
+        ra, dec = detector_to_sky(1.0, 0.0, self.PLATE, 90.0, +1, +1)
+        assert ra  == pytest.approx(0.0, abs=1e-12)
+        assert dec == pytest.approx(-self.PLATE)
+
+    def test_parity_flip_x(self):
+        # Flipping parity_x flips the RA contribution.
+        ra_p, _ = detector_to_sky(1.0, 0.0, self.PLATE, 0.0, +1, +1)
+        ra_n, _ = detector_to_sky(1.0, 0.0, self.PLATE, 0.0, -1, +1)
+        assert ra_n == pytest.approx(-ra_p)
+
+    def test_full_pa_sweep_preserves_magnitude(self):
+        # The total (RA, Dec) magnitude must equal sqrt(dx^2 + dy^2) * plate
+        # for any PA / parity combo (a rotation+sign-flip preserves L2).
+        for pa_deg in (0, 17, 33, 90, 180, 271, 359):
+            for px, py in (-1, -1), (+1, +1), (+3, -2):
+                for parx in (+1, -1):
+                    for pary in (+1, -1):
+                        ra, dec = detector_to_sky(
+                            float(px), float(py), self.PLATE, float(pa_deg), parx, pary,
+                        )
+                        expected = self.PLATE * math.hypot(px, py)
+                        assert math.hypot(ra, dec) == pytest.approx(expected, abs=1e-9)
+```
+
+- [ ] **Step 2: Run the tests, confirm they fail.**
+
+Run: `uv run pytest tests/unit/test_geometry.py -v`
+Expected: import error.
+
+- [ ] **Step 3: Implement `core/geometry.py`.**
+
+Create `henrietta_guider/core/geometry.py`:
+
+```python
+"""Detector → sky transform.
+
+The Henrietta detector pixel offsets (dx_px, dy_px) measured by the
+2-D xcor pipeline must be converted to sky-frame offsets (RA, Dec) in
+arcseconds before the controller acts on them. The TCS guide port
+expects sky-frame offsets (see Wireformat.md).
+
+Sign convention (TBC with William; see Q14 in Questions-for-William.md):
+
+    sky offset = telescope correction = -(measured drift)
+
+In other words, if the trace has drifted +1 px in detector X, the
+telescope must move -1 px in detector X (from its current pointing) to
+bring the trace back. The minus sign lives here so the controller can
+work in the "drive error to zero" convention.
+
+Parity_x and parity_y encode the detector's handedness on the sky at
+PA = 0: e.g. parity_x = +1 means +X-detector aligns with +RA-sky at
+PA = 0; parity_x = -1 means it aligns with -RA. These are pinned in
+config and verified against an on-sky test offset during commissioning.
+"""
+
+from __future__ import annotations
+
+import math
+
+
+def detector_to_sky(
+    dx_px: float,
+    dy_px: float,
+    plate_scale_arcsec_per_px: float,
+    pa_deg: float,
+    parity_x: int,
+    parity_y: int,
+) -> tuple[float, float]:
+    """Convert a measured detector pixel drift to a sky-frame correction.
+
+    Returns (dRA_arcsec, dDec_arcsec) — the telescope correction that
+    cancels the drift.
+    """
+    dx_arcsec = parity_x * dx_px * plate_scale_arcsec_per_px
+    dy_arcsec = parity_y * dy_px * plate_scale_arcsec_per_px
+    pa = math.radians(pa_deg)
+    cos_pa, sin_pa = math.cos(pa), math.sin(pa)
+    dra  = -dx_arcsec * cos_pa - dy_arcsec * sin_pa
+    ddec = -dx_arcsec * sin_pa + dy_arcsec * cos_pa
+    return dra, ddec
+```
+
+- [ ] **Step 4: Run the tests, confirm they pass.**
+
+Run: `uv run pytest tests/unit/test_geometry.py -v`
+Expected: all green.
+
+- [ ] **Step 5: Lint.**
+
+Run: `uv run ruff format . && uv run ruff check .`
+Expected: clean.
+
+- [ ] **Step 6: Commit.**
+
+```bash
+git add henrietta_guider/core/geometry.py tests/unit/test_geometry.py
+git commit -m "core: detector to sky transform (PA + plate scale + parity)"
+```
+
+### Task 2.4: Per-axis controller
+
+**Files:**
+- Create: `henrietta_guider/core/controller.py`
+- Create: `tests/unit/test_controller.py`
+
+Per-axis P controller for v1 with `Ki` and `Kd` fields already in the dataclass for forward compatibility. Dead band suppresses noise-floor commands; max-command clip keeps a single send within the wire range. The output is the **command** (signed arcseconds) that the worker hands to `tcs_client.send_guide()`.
+
+The "freeze accumulators while ALERTED" semantics for PI/PID (see §5 of the spec) are stubbed in the dataclass but irrelevant for v1's pure-P. The test fixture exercises the dataclass interface so adding integral/derivative state later doesn't break callers.
+
+- [ ] **Step 1: Write the failing tests.**
+
+Create `tests/unit/test_controller.py`:
+
+```python
+import pytest
+
+from henrietta_guider.core.controller import Controller, ControllerConfig
+
+
+@pytest.mark.unit
+class TestController:
+    def _make(self, **overrides):
+        cfg = ControllerConfig(**{
+            "Kp": 0.5, "Ki": 0.0, "Kd": 0.0,
+            "deadband_arcsec": 0.025, "max_command_arcsec": 2.45,
+            **overrides,
+        })
+        return Controller(cfg)
+
+    def test_zero_error_zero_command(self):
+        ctrl = self._make()
+        assert ctrl.step(0.0) == 0.0
+
+    def test_proportional(self):
+        ctrl = self._make(Kp=0.5)
+        assert ctrl.step(0.10) == pytest.approx(0.05)
+
+    def test_deadband_suppresses_small_errors(self):
+        ctrl = self._make(deadband_arcsec=0.05)
+        assert ctrl.step(0.04) == 0.0
+        assert ctrl.step(-0.04) == 0.0
+
+    def test_deadband_passes_threshold(self):
+        ctrl = self._make(Kp=1.0, deadband_arcsec=0.05)
+        assert ctrl.step(0.06) == pytest.approx(0.06)
+
+    def test_max_command_clips(self):
+        ctrl = self._make(Kp=1.0, max_command_arcsec=2.45)
+        assert ctrl.step(+5.0) == pytest.approx(+2.45)
+        assert ctrl.step(-5.0) == pytest.approx(-2.45)
+
+    def test_alerted_freezes_state_v1_pure_p(self):
+        # In v1 the controller is pure-P (stateless), so on_alerted() is
+        # a no-op. The test fixture exists so future PI/PID code can't
+        # silently break the contract.
+        ctrl = self._make()
+        ctrl.on_alerted()
+        assert ctrl.step(0.10) == pytest.approx(0.05)
+```
+
+- [ ] **Step 2: Run the tests, confirm they fail.**
+
+Run: `uv run pytest tests/unit/test_controller.py -v`
+Expected: import error.
+
+- [ ] **Step 3: Implement `core/controller.py`.**
+
+Create `henrietta_guider/core/controller.py`:
+
+```python
+"""Per-axis P controller (with PI/PID hooks for forward compatibility).
+
+The controller takes a measured error in arcseconds and returns the
+command in arcseconds. Dead band suppresses noise-floor commands; the
+max-command clip keeps a single command within the wire range. v1 uses
+pure-P; Ki and Kd live in the config and are used once the PI/PID
+machinery is added.
+
+Sign convention: step() is called with `error_arcsec = -measured_drift`
+already converted to sky frame by geometry.detector_to_sky(). The
+controller multiplies by Kp and returns the command directly (no
+sign flip here).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class ControllerConfig:
+    Kp: float = 0.5
+    Ki: float = 0.0
+    Kd: float = 0.0
+    deadband_arcsec: float = 0.025
+    max_command_arcsec: float = 2.45
+
+
+class Controller:
+    def __init__(self, cfg: ControllerConfig) -> None:
+        self.cfg = cfg
+        # Reserved for PI/PID; unused in v1.
+        self._integral: float = 0.0
+        self._last_error: float | None = None
+        self._frozen: bool = False
+
+    def step(self, error_arcsec: float) -> float:
+        """Compute the command for one error sample."""
+        if abs(error_arcsec) < self.cfg.deadband_arcsec:
+            return 0.0
+        cmd = self.cfg.Kp * error_arcsec
+        # Ki / Kd hooks. Disabled when frozen.
+        if not self._frozen:
+            self._integral += error_arcsec  # accumulator (used when Ki > 0)
+            self._last_error = error_arcsec
+        cmd += self.cfg.Ki * self._integral
+        # (Kd term omitted in v1; would use _last_error here.)
+        # Clip.
+        if cmd > self.cfg.max_command_arcsec:
+            cmd = self.cfg.max_command_arcsec
+        elif cmd < -self.cfg.max_command_arcsec:
+            cmd = -self.cfg.max_command_arcsec
+        return cmd
+
+    def on_alerted(self) -> None:
+        """Freeze integral / derivative accumulators while ALERTED.
+
+        v1: no-op (pure-P, stateless). When PI/PID is enabled later,
+        this will stop _integral and _last_error from updating during
+        ALERTED so the loop resumes cleanly without wind-up.
+        """
+        self._frozen = True
+
+    def on_resumed(self) -> None:
+        """Re-enable accumulators after ALERTED -> GUIDING."""
+        self._frozen = False
+```
+
+- [ ] **Step 4: Run the tests, confirm they pass.**
+
+Run: `uv run pytest tests/unit/test_controller.py -v`
+Expected: all green.
+
+- [ ] **Step 5: Lint.**
+
+Run: `uv run ruff format . && uv run ruff check .`
+Expected: clean.
+
+- [ ] **Step 6: Commit.**
+
+```bash
+git add henrietta_guider/core/controller.py tests/unit/test_controller.py
+git commit -m "core: per-axis P controller with PI/PID hooks"
+```
+
+### Task 2.5: End-of-chunk verification
+
+- [ ] **Step 1: Run the full test suite.**
+
+Run: `make test`
+Expected: 4 modules' worth of tests, all green; should finish in well under 30 seconds.
+
+- [ ] **Step 2: Run lint.**
+
+Run: `make lint`
+Expected: clean.
+
+- [ ] **Step 3: Confirm CI passes on the push.**
+
+Run: `git log --oneline -10`
+Confirm the four new commits are there. Push if not already pushed (the per-task commits don't push automatically), then check GitHub Actions.
+
+- [ ] **Step 4: Confirm git status is clean.**
+
+Run: `git status`
+Expected: "nothing to commit, working tree clean."
+
+End of Chunk 2. Working state: pure-computational core fully tested. The autoguider can now encode/decode wire frames, talk to a TCP socket with pacing, transform detector pixels to sky offsets, and run a per-axis P controller — but no I/O orchestration, file watching, or GUI yet.
+
+---
