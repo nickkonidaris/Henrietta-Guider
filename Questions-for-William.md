@@ -28,10 +28,19 @@ Last updated: 2026-04-30
 
 ## Archon / SUTR frame delivery
 
-6. **File-completeness convention.** We're assuming the Archon writes
-   `foo.fits.tmp` and atomic-renames to `foo.fits` once the SUTR is collapsed
-   and written. **Confirm** this is what the Archon actually does (or tell us
-   the real convention).
+6. **File-completeness convention.** William's preliminary answer is that
+   the Archon writes files **directly to the directory in place** — no
+   `.tmp` step, no atomic rename. To confirm tomorrow.
+   - If confirmed: the autoguider's watcher detects completion via a
+     1-second size-stable settle plus an `astropy.io.fits` open-and-check.
+     This works but is slightly more fragile than atomic rename.
+   - Worth asking William whether the Archon **could** be configured to
+     write `foo.fits.tmp` first and atomic-rename — that's the most
+     robust pattern (single `on_moved` event, no settle timer, no
+     half-written-file edge cases). Often a one-line change in the
+     writer.
+   - Either way: is there a sidecar marker file (e.g. `foo.fits.done`,
+     `foo.fits.ok`) we could watch for instead of inferring completion?
 7. **Output directory.** Where does the Archon write completed SUTR frames?
    Configurable, or fixed?
 8. **Filename convention.** Real-data sample shows

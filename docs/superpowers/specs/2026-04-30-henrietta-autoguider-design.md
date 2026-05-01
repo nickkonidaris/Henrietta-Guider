@@ -149,12 +149,29 @@ The choice of uv is deliberate: in five years macOS will not ship Python
 ### File watching
 
 A `watchdog.Observer` is launched on the user-selected `archon_watch_dir`.
-We listen for `on_moved` events ending in `.fits` — the Archon is assumed
-to use
-**atomic rename** (`foo.fits.tmp` → `foo.fits`) to signal completeness.
-Filenames `henNNNN_sss.fits` are parsed: `NNNN` is the integration / frame
-number, `sss` is the SUTR sample number within that integration. Many `_sss`
-files are produced per integration.
+The Archon writes each FITS file in place (no `.tmp` + rename), so we
+have to detect completion ourselves rather than rely on `on_moved` for an
+atomic rename.
+
+The watcher subscribes to both `on_created` and `on_modified` events for
+`.fits` paths. Whenever an event arrives for a file, we (re)set a 1.0-s
+"settle timer" for that path; once the timer fires with no further events,
+we attempt to open the file with `astropy.io.fits` in update-strict mode.
+A successful open with `NAXIS1 × NAXIS2 × |BITPIX|/8` matching the data
+section size confirms the file is complete; otherwise the file is still
+being written and we wait for the next event.
+
+The 1.0-s settle is safe at the file-size level (8 MB writes in well under
+100 ms on modern disks) and well below the smallest SUTR sample interval
+of 1.3 s.
+
+The real filename pattern (per the sample frames in `test/`) is
+`henNNNN_sssr.fits` for the per-SUTR raw reads (e.g. `hen1764_017r.fits`),
+plus a final integrated `henNNNN.fits` per integration. The watcher
+matches `^hen(\d{4})_(\d{3})r\.fits$` and ignores any other filename
+pattern (the bare `henNNNN.fits` carries no new SUTR information beyond
+what `_023r` already gave us, so it is logged at DEBUG and dropped). The
+parsed `(NNNN, sss)` are pushed into the inbound queue.
 
 ### Stale-frame watchdog
 
