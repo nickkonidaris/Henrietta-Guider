@@ -46,17 +46,18 @@ non-periodic mount errors.
 
 note the directories here are notional:
 ```
-┌────────────────────────┐         ┌────────────────────────┐
-│  Archon (separate system) │  FITS   │  Watch directory       │
-│  writes henNNNN_sss.fits ─────►  │  /data/<night>/...     │
-└────────────────────────┘         └──────────┬─────────────┘
-                                              │ atomic rename → on_moved
+┌──────────────────────────┐       ┌────────────────────────┐
+│  Archon (separate system)│ FITS  │  Watch directory       │
+│  writes henNNNN_sssr.fits├──────►│  /data/<night>/...     │
+│  + henNNNN.fits          │       └──────────┬─────────────┘
+└──────────────────────────┘                  │ on_created/on_modified
+                                              │ + 0.2 s settle timer
                                               ▼
                                    ┌────────────────────────┐
                                    │  henrietta_guider/core │
-                                   │   watcher → reduce →   │
-                                   │   centroid → control → │
-                                   │   tcs_client → store   │
+                                   │   watcher → measure →  │
+                                   │   control → tcs_client │
+                                   │   → store              │
                                    └──┬─────────────────┬───┘
                                       │ G xx yy CR      │ rows
                                       ▼                 ▼
@@ -95,7 +96,7 @@ false.
 ```
 henrietta_guider/
 ├── core/                      no UI imports anywhere in this subtree
-│   ├── watcher.py             watchdog + atomic-rename → image queue
+│   ├── watcher.py             watchdog + 0.2 s settle → image queue
 │   ├── reduce.py              SUTR FrameBuffer, masking, bg subtraction
 │   ├── measure.py             stamp prep, local sky subtraction, BPM,
 │   │                          2-D xcor against template, sub-pixel peak,
@@ -401,12 +402,17 @@ SUTRs, so on its own it is a high-SNR representation of the trace. The
 autoguider keeps **one** template at a time.
 
 When the user clicks **"Build Template"**, the most recent
-`henNNNN.fits` is taken (failing the request if none has arrived yet on
-the current target). The build is validated (no read error, enough
-unmasked pixels in the stamp, non-zero variance after sky subtraction).
-On success that frame becomes the active template and the GUI moves to
-`REFERENCE_SET`; on failure an `ERROR` banner appears and the user
-stays in `REFERENCE_PENDING`.
+`henNNNN.fits` is taken. The build can fail for any of:
+
+- no `henNNNN.fits` has arrived yet on the current target;
+- the file fails to open / is corrupt;
+- too few unmasked pixels in the stamp;
+- zero variance after sky subtraction.
+
+Any of these triggers the **"template build failure"** path: an
+`ERROR`-level banner with the specific cause, the warning sound (§9),
+and the state stays at `REFERENCE_PENDING`. On success the frame
+becomes the active template and the state moves to `REFERENCE_SET`.
 
 By default the template **stays fixed** for the rest of the session —
 exactly the frame the user pointed at, until they explicitly click
@@ -500,17 +506,28 @@ Per-frame quantities recorded for analysis:
   `signal_snr_median` and `signal_snr_p10` (10th-percentile across
   unmasked stamp pixels).
 
+  **Edge cases.** If the stamp has zero unmasked pixels (e.g., the BPM
+  swallowed everything in a misconfigured stamp), or if any pixel has
+  `signal_DN ≤ 0` (it's clipped to 0 before the sqrt), or if the MAD
+  used for the histogram's Gaussian overlay is zero (degenerate
+  one-value distribution), the autoguider:
+  - writes `NULL` for `signal_snr_median` and `signal_snr_p10` in
+    `stamp_measurements`;
+  - shows the histogram panel as empty with a centred "no data" label;
+  - logs a `WARNING` once (not per-frame).
+
 `(dx_px, dy_px)` are converted to sky offsets (§6).
 
 ## 5. Quality control & alerts
 
-For the science box, running statistics over the last
+For the science stamp, running statistics over the last
 `quality.out_of_family_window` accepted frames (default 20) — median + MAD
 of:
 
 - `trace_flux_adu`
 - `trace_fwhm_x_px`
 - `sky_background_adu`
+- `xcor_peak_value`
 - `dx_px`, `dy_px`
 
 **Warm-up.** Out-of-family checks are gated on having collected at least
@@ -537,7 +554,7 @@ integral and derivative accumulators **freeze** while `ALERTED` (do not
 update with the rejected error, do not zero) and resume on the first
 in-family frame. This avoids both wind-up and a discontinuity on resume.
 
-The comparison box runs identical statistics independently — purely
+The comparison stamp runs identical statistics independently — purely
 diagnostic.
 
 The **stale-frame watchdog** (§4) is a separate alert path with its own
@@ -642,7 +659,7 @@ file event → diff image → 2-D xcor measurement (science + comparison)
                                 │
                           ┌─────┴─────┐
                           ▼           ▼
-                      LOCKED      ALERTED → no command, alert
+                      GUIDING     ALERTED → no command, alert
                           │
               PA rotation, plate scale → (dRA, dDec)
                           │
@@ -757,8 +774,13 @@ Sections: `[loop]`, `[quality]`, `[reduction]`, `[files]`, `[tcs]`,
   slow shape evolution matters. Default off — the template stays fixed
   until the user clicks Build Template again.)
 - `reduction.template_min_peak_value = 0.0`
-  (minimum acceptable xcor peak value; below this the frame is flagged
-  in `quality_flags`. Default 0 = no threshold; tune empirically.)
+  (minimum acceptable xcor peak value; below this the frame's
+  `quality_flags` gets a `"low_xcor_peak"` entry. **v1: advisory flag
+  only — the controller does not suppress the command on this signal**;
+  the standalone out-of-family path on `xcor_peak_value` (running
+  median + MAD) is what catches genuinely bad correlations and
+  triggers ALERTED. Default 0 = no threshold; raise empirically once
+  commissioning shows a useful floor.)
 - `detector.y_middle_row = 1024` (placeholder)
 - `detector.gain_e_per_dn = 4.0` (placeholder)
 - `detector.read_noise_e = 12.0` (placeholder)
@@ -861,9 +883,11 @@ On change, regardless of starting state:
 2. Clear the rolling SUTR buffer (no reads carry across).
 3. Discard the in-memory template (it was tied to the previous
    directory's frames).
-4. Restart the observer on the new path.
-5. Persist `archon_watch_dir` to `session.toml`.
-6. Transition the state machine: from any of `REFERENCE_SET`, `GUIDING`,
+4. Reset the out-of-family running statistics (median, MAD, warmup
+   counter) — same as on stale-frame timeout and target-switch.
+5. Restart the observer on the new path.
+6. Persist `archon_watch_dir` to `session.toml`.
+7. Transition the state machine: from any of `REFERENCE_SET`, `GUIDING`,
    `ALERTED`, or `PAUSED`, the state drops to **`REFERENCE_PENDING`**;
    from `IDLE`, it stays in `IDLE`. Stamp geometry is preserved
    (detector-frame and not directory-bound). The user must click "Build
@@ -938,9 +962,9 @@ sound:
 - **TCS disconnect** — guiding can't proceed because commands are not
   reaching the telescope.
 - **template build failure** — Build Template was clicked but the
-  source `henNNNN.fits` couldn't produce a usable template (read error,
-  too few unmasked pixels in the stamp, or zero variance after sky
-  subtraction).
+  source frame couldn't produce a usable template (no `henNNNN.fits`
+  has arrived yet, file open error, too few unmasked pixels in the
+  stamp, or zero variance after sky subtraction).
 - **out-of-family ALERT entry** — guiding has paused; commands are
   suppressed pending self-recovery. Plays only on *entry* into the
   ALERTED state, not for each rejected frame, and not again on auto-
