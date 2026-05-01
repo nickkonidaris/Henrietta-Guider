@@ -53,8 +53,8 @@ Following the `superpowers:brainstorming` skill. Phase progress:
   rotation before encoding.
 
 ### Frame model
-- DAQ writes `henNNNN_sss.fits`. `NNNN` = integration number, `sss` = SUTR
-  sample within that integration. Many `_sss` files per integration.
+- Archon writes `henNNNN_sss.fits`. `NNNN` = integration number, `sss` =
+  SUTR sample within that integration. Many `_sss` files per integration.
 - Each `_sss.fits` is a raw non-destructive read.
 - Guide image = `mean(reads[N+1..N+K]) − mean(reads[N+1−K..N])`.
 - Default **K = 1**, **overlapping windows** (stride = 1). Both settable.
@@ -171,7 +171,7 @@ User mentioned that 2D xcor "can work to find the pixel shifts." Options:
 ### Tracked external dependencies (William, the SWE)
 
 `Questions-for-William.md` at the repo root. Categories: TCS protocol
-(settle time, ACK semantics, status channel), DAQ delivery (atomic-rename
+(settle time, ACK semantics, status channel), Archon delivery (atomic-rename
 confirmation, output dir, FITS keyword inventory, intermediate reads),
 detector parameters (gain, RN, saturation, `y_middle_row`), bad-pixel mask
 (source, format, lifecycle), instrument geometry (PA convention, plate

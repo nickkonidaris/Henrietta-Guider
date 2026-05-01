@@ -3,14 +3,14 @@
 **Status:** Draft (brainstormed, not yet implemented)
 **Date:** 2026-04-30
 **Owner:** Nick Konidaris
-**Collaborator (TCS / DAQ):** William
+**Collaborator (TCS / Archon):** William
 
 ## 1. Purpose & scope
 
 The Henrietta autoguider keeps the science spectrum on the same detector pixels
 during long IR-spectroscopic observations on the Swope telescope. It runs on the
 Henrietta instrument computer, watches a directory for SUTR (sample-up-the-
-ramp) FITS frames produced by the Archon Ctonroller, measures the trace position
+ramp) FITS frames produced by the Archon controller, measures the trace position
 relative to a calibrated reference, and sends small (±2.5″) telescope offsets to
 the TCS over TCP/IP to bring the trace back on target.
 
@@ -34,7 +34,7 @@ non-periodic mount errors.
 - Target acquisition or large telescope offsets (the wire protocol is too
   narrow; observer acquires manually via TCS).
 - Closed-loop fault recovery (raise alerts and pause; do not auto-restart the
-  DAQ or re-acquire).
+  Archon or re-acquire).
 - Multi-target scheduling (handled by the separate Henrietta-Target-Picker).
 - A dedicated cosmic-ray rejection algorithm (medianing throughout the
   pipeline + the bad-pixel mask are sufficient — see §11).
@@ -74,7 +74,7 @@ note the directories here are notional:
 The guider only applies corrections within one exposure's SUTRs — it
 infers a new exposure has begun by noticing a new `NNNN` in the filename
 and discards its rolling-read buffer at that point. There is no
-out-of-band signal from the DAQ or TCS: no "exposure starting / ending"
+out-of-band signal from the Archon or TCS: no "exposure starting / ending"
 notification, no pointing-state readback, no acknowledgment of
 corrections. The guider's world is "FITS files appear in a directory;
 emit corrections and rows."
@@ -148,8 +148,9 @@ The choice of uv is deliberate: in five years macOS will not ship Python
 
 ### File watching
 
-A `watchdog.Observer` is launched on the user-selected `daq_watch_dir`. We
-listen for `on_moved` events ending in `.fits` — the DAQ is assumed to use
+A `watchdog.Observer` is launched on the user-selected `archon_watch_dir`.
+We listen for `on_moved` events ending in `.fits` — the Archon is assumed
+to use
 **atomic rename** (`foo.fits.tmp` → `foo.fits`) to signal completeness.
 Filenames `henNNNN_sss.fits` are parsed: `NNNN` is the integration / frame
 number, `sss` is the SUTR sample number within that integration. Many `_sss`
@@ -586,7 +587,7 @@ location for the GUI's directory picker.
 
 Holds the daily-changing state:
 
-- `daq_watch_dir` — selected via OS folder picker each night.
+- `archon_watch_dir` — selected via OS folder picker each night.
 - Box geometries (science, science_bg_left, science_bg_right, comparison,
   comparison_bg_left, comparison_bg_right).
 - Ridge state (`angle_deg`, `x_center_px`).
@@ -642,7 +643,7 @@ still drawn.
 ### Watch directory
 
 Opens an OS-native folder picker (`tkinter.filedialog.askdirectory`) at
-startup if the previously-saved `daq_watch_dir` doesn't exist, and on demand
+startup if the previously-saved `archon_watch_dir` doesn't exist, and on demand
 via the **[Change…]** button in the status bar. The button is enabled in
 **every** state, including `GUIDING`.
 
@@ -653,7 +654,7 @@ On change, regardless of starting state:
 3. Discard the in-memory reference image and reference 1-D profile (they
    were tied to the previous directory's frames).
 4. Restart the observer on the new path.
-5. Persist `daq_watch_dir` to `session.toml`.
+5. Persist `archon_watch_dir` to `session.toml`.
 6. Transition the state machine: from any of `REFERENCE_SET`, `GUIDING`,
    `ALERTED`, or `PAUSED`, the state drops to **`REFERENCE_PENDING`**;
    from `IDLE`, it stays in `IDLE`. Box geometry, ridge coefficients, and
@@ -745,17 +746,17 @@ The log is the second source of truth after SQLite for debugging.
 
 ### Integration (`tests/integration/`)
 
-A `FakeDAQ` writes a sequence of FITS frames into a tempdir using the
+A `FakeArchon` writes a sequence of FITS frames into a tempdir using the
 atomic-rename pattern. The test launches the core in a thread, lets it
 process the sequence, and asserts:
 
 - expected SQLite rows exist;
 - expected G commands arrive at a `FakeTCS` (a `socket.socketpair`-based
   recorder);
-- out-of-family alerts trigger when the fake DAQ injects a bad frame;
-- stale-frame timeout fires when the fake DAQ stops writing;
+- out-of-family alerts trigger when the fake Archon injects a bad frame;
+- stale-frame timeout fires when the fake Archon stops writing;
 - a synthesised telescope-offset round trip — inject a known shift on the
-  fake DAQ side, assert the inverse correction is sent.
+  fake Archon side, assert the inverse correction is sent.
 
 ### Manual / hardware-in-loop
 
@@ -811,7 +812,7 @@ Tracked in `Questions-for-William.md` at the repo root. Summary by area:
 
 - TCS settle time, `guider_cmd_processing` semantics, status / telemetry
   channel availability, ACK behaviour.
-- DAQ atomic-rename convention confirmation, output directory, FITS keyword
+- Archon atomic-rename convention confirmation, output directory, FITS keyword
   inventory (HA, Dec, PA, airmass, temperature, focus, exposure time, UTC),
   intermediate-read availability (already confirmed: not available).
 - Detector parameters: gain (placeholder 4 e⁻/DN), read noise, saturation

@@ -1,8 +1,8 @@
 # Open Questions for William (Software Engineer)
 
 Running list of questions that need to be answered by William as the TCS /
-DAQ subject-matter expert. Items here block or shape parts of the autoguider
-design.
+Archon / TCS subject-matter expert. Items here block or shape parts of the
+autoguider design.
 
 Last updated: 2026-04-30
 
@@ -26,13 +26,13 @@ Last updated: 2026-04-30
 5. **Timing on the wire.** Any delay we should expect between TCP send and
    the offset being applied?
 
-## DAQ / SUTR frame delivery
+## Archon / SUTR frame delivery
 
-6. **File-completeness convention.** We're assuming the DAQ writes
+6. **File-completeness convention.** We're assuming the Archon writes
    `foo.fits.tmp` and atomic-renames to `foo.fits` once the SUTR is collapsed
-   and written. **Confirm** this is what the DAQ actually does (or tell us the
-   real convention).
-7. **Output directory.** Where does the DAQ write completed SUTR frames?
+   and written. **Confirm** this is what the Archon actually does (or tell us
+   the real convention).
+7. **Output directory.** Where does the Archon write completed SUTR frames?
    Configurable, or fixed?
 8. **Filename convention.** Real-data sample shows
    `henNNNN_sssr.fits` (e.g. `hen1764_001r.fits`) for the per-SUTR raw
@@ -61,7 +61,7 @@ Last updated: 2026-04-30
      case (e.g. dark-corrected runs) with extra HDUs?
 10. **Pointing in the FITS header.** Are HA, Dec, RA, Dec, rotator angle (PA),
     UTC, exposure time, airmass, **detector temperature**, and **focus
-    position** all already written to the FITS header by the DAQ? Exact
+    position** all already written to the FITS header by the Archon? Exact
     keyword names? (We need HA & Dec to bin the guiding measurements for
     nonperiodic-error analysis, and the others for diagnostics.)
 11. **Intermediate non-destructive reads.** Confirmed not available — the
