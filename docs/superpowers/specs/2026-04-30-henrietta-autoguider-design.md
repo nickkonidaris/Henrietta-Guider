@@ -102,7 +102,7 @@ henrietta_guider/
 │   │                          FWHM, flux
 │   ├── controller.py          P (PI/PID hooks), dead band, max clip
 │   ├── tcs_client.py          TCP socket, G-command encoder, pacing
-│   ├── store.py               SQLite (frames + box_measurements tables)
+│   ├── store.py               SQLite (frames + stamp_measurements tables)
 │   ├── geometry.py            detector → sky transform (plate scale, PA)
 │   ├── monte_carlo.py         "Estimate K" simulator
 │   └── config.py              dataclass schema, TOML load/save
@@ -213,7 +213,7 @@ across frames. The watcher enforces this and flags violations:
     warning sound as out-of-order SUTRs. Should never happen in normal
     operation; serious if it does.
 
-Every violation also lands in `quality_flags` on the `box_measurements`
+Every violation also lands in `quality_flags` on the `stamp_measurements`
 row (for non-discarded frames) so retrospective analysis can spot
 patterns even when the operator missed the live alert.
 
@@ -224,7 +224,7 @@ guide image. If it exceeds `quality.stale_frame_timeout_s` (default 30 s),
 guiding **stops** — not pauses — because a 30-second gap likely means
 something operationally significant has happened (target slewed, Archon
 restarted, observer paused the run, target swap). Auto-resuming with a
-stale reference image after that long is unsafe.
+stale template after that long is unsafe.
 
 Concretely:
 
@@ -265,7 +265,7 @@ serious indication of a real target swap. **Full alert**:
 - An `ERROR`-level banner: "Target change possible — pointing jumped %.1f″"
 - The warning sound + the spoken phrase "target change possible" (§9).
 - State machine transitions to `REFERENCE_PENDING`, discarding the
-  reference image and resetting out-of-family running statistics.
+  template and resetting out-of-family running statistics.
 
 #### OBJECT keyword change (advisory)
 
@@ -288,7 +288,7 @@ just the label (you get only the small beep, and guiding rolls on).
 If both checks trip on the same frame, the pointing-jump path wins
 (full alert; the small beep is suppressed).
 
-The first frame after a fresh `Save Reference` is treated as the new
+The first frame after a fresh `Build Template` is treated as the new
 "previous" — no comparison is made, so the very first frame on a new
 target never trips either check.
 
@@ -383,8 +383,8 @@ the time-series plot.
 
 ### Template build
 
-The reference (= the "where I want the trace to live") is captured as a
-**2-D template image**, not as a fitted ridge.
+The reference (= the "where I want the trace to live") is a 2-D
+template image held in memory.
 
 When the user clicks **"Build Template"** in the GUI, the source frame
 is the most recent **`henNNNN.fits`** — the slope-fit final image
@@ -604,7 +604,7 @@ suppressed" counter.
 ### Loop wiring
 
 ```
-file event → diff image → ridge measurement (science + comparison)
+file event → diff image → 2-D xcor measurement (science + comparison)
                                 │
                                 ▼
                   out-of-family check (science)
@@ -623,7 +623,7 @@ file event → diff image → ridge measurement (science + comparison)
                           │
                   send G command (or defer)
                           │
-                  insert frames + box_measurements rows
+                  insert frames + stamp_measurements rows
                           │
                   push event to GUI queue
 ```
@@ -659,23 +659,25 @@ CREATE TABLE frames (
     PRIMARY KEY (frame_number, sutr_number)
 );
 
-CREATE TABLE box_measurements (
-    frame_number       INTEGER NOT NULL,
-    sutr_number        INTEGER NOT NULL,
-    box_id             INTEGER NOT NULL,    -- 0 = science, 1 = comparison
-    box_xmin           INTEGER,
-    box_xmax           INTEGER,
-    box_ymin           INTEGER,
-    box_ymax           INTEGER,
-    ridge_x_center_px  REAL,
-    ridge_angle_deg    REAL,
-    dx_px              REAL,
-    dy_px              REAL,
-    trace_fwhm_x_px    REAL,
-    trace_flux_adu     REAL,
-    sky_background_adu REAL,
-    quality_flags      TEXT,                -- JSON
-    PRIMARY KEY (frame_number, sutr_number, box_id),
+CREATE TABLE stamp_measurements (
+    frame_number          INTEGER NOT NULL,
+    sutr_number           INTEGER NOT NULL,
+    stamp_id              INTEGER NOT NULL,   -- 0 = science, 1 = comparison
+    stamp_x_center        INTEGER,            -- detector pixel
+    stamp_x_halfwidth     INTEGER,
+    stamp_y_lo            INTEGER,
+    stamp_y_hi            INTEGER,
+    template_frame_number INTEGER,            -- which henNNNN.fits built the active template
+    dx_px                 REAL,               -- xcor sub-pixel shift
+    dy_px                 REAL,
+    xcor_peak_value       REAL,               -- C(δx_peak, δy_peak)
+    xcor_curvature_x      REAL,               -- (a − 2b + c) along X at peak; precision proxy
+    xcor_curvature_y      REAL,
+    trace_fwhm_x_px       REAL,
+    trace_flux_adu        REAL,
+    sky_background_adu    REAL,
+    quality_flags         TEXT,               -- JSON
+    PRIMARY KEY (frame_number, sutr_number, stamp_id),
     FOREIGN KEY (frame_number, sutr_number)
         REFERENCES frames(frame_number, sutr_number)
 );
@@ -711,10 +713,17 @@ Sections: `[loop]`, `[quality]`, `[reduction]`, `[files]`, `[tcs]`,
 - `quality.auto_resume_in_family = 3`
 - `quality.stale_frame_timeout_s = 30.0`
 - `quality.target_switch_arcsec_threshold = 20.0`
-- `reduction.K = 1`, `reduction.stride = 1`, `reduction.ridge_degree = 1`
-- `reduction.min_ridge_rows = 20`
-- `reduction.max_ridge_residual_px = 0.5`
-- `reduction.max_ridge_angle_deg = 10.0`
+- `reduction.K = 1`, `reduction.stride = 1`
+- `reduction.stamp_x_halfwidth_px = 25`
+- `reduction.stamp_y_lo = 600`, `reduction.stamp_y_hi = 1980`
+  (filter cutoff to filter cutoff; tune per detector / filter)
+- `reduction.xcor_search_radius_px = 12`
+- `reduction.sliding_template = false`
+  (when `true`, every new `henNNNN.fits` replaces the active template;
+  use for sequences ≳ 5 min where slow shape evolution matters)
+- `reduction.template_min_peak_value = 0.0`
+  (minimum acceptable xcor peak value; below this the frame is flagged
+  in `quality_flags`. Default 0 = no threshold; tune empirically.)
 - `detector.y_middle_row = 1024` (placeholder)
 - `detector.gain_e_per_dn = 4.0` (placeholder)
 - `detector.read_noise_e = 12.0` (placeholder)
@@ -740,13 +749,11 @@ location for the GUI's directory picker.
 Holds the daily-changing state:
 
 - `archon_watch_dir` — selected via OS folder picker each night.
-- Box geometries (science, science_bg_left, science_bg_right, comparison,
-  comparison_bg_left, comparison_bg_right).
-- Ridge state (`angle_deg`, `x_center_px`).
-- Targets (`desired_ridge_x_px`, `desired_ridge_y_px`).
+- Stamp geometries (`science_stamp` and optionally `comparison_stamp`),
+  each with `x_center`, `x_halfwidth`, `y_lo`, `y_hi`.
 
-Reference image and reference 1-D profile are **not** persisted — they must
-be re-captured each session from a fresh high-SNR frame.
+The active **template** itself is held only in memory and is **not**
+persisted — it must be re-built each session from a fresh `henNNNN.fits`.
 
 ## 9. GUI
 
@@ -756,15 +763,17 @@ Single Tk window, layout:
 ┌─ status bar ─────────────────────────────────────────────────────────┐
 │ TCS ●  │ Watcher ●  │ State: GUIDING │ Watch dir: /data/... [Change…]│
 ├──────────────────────────┬───────────────────────────────────────────┤
-│  matplotlib live image   │  Boxes:    [Draw science] [Add comparison]│
-│   - science box (red)    │            [Reset bg boxes]               │
-│   - science bg ×2 (orng) │                                           │
-│   - comparison (cyan)    │  Ridge:    angle = ___°   x_center = ___ │
-│   - ridge line + handles │            [auto-fit] [edit] [Save ref]   │
+│  matplotlib live image   │  Stamps:   [Draw science] [Add comparison]│
+│   - science stamp (red)  │            [Reset to defaults]            │
+│   - comparison (cyan)    │                                           │
+│   - template thumbnail   │  Stamp geometry (science):                │
+│     overlay (small)      │    x_center:    __________ px             │
+│                          │    x_halfwidth: __________ px             │
+│                          │    y_lo:        __________ px             │
+│                          │    y_hi:        __________ px             │
 │                          │                                           │
-│                          │  Targets (commandable):                   │
-│                          │    desired ridge_x: __________ px         │
-│                          │    desired ridge_y: __________ px         │
+│                          │  Template: built from hen0042.fits        │
+│                          │            [Build Template]               │
 │                          │                                           │
 │                          │  Loop:     [START]  [STOP]  [PAUSE]       │
 │                          │  Tools:    [Estimate K]  [Settings…]      │
@@ -774,6 +783,7 @@ Single Tk window, layout:
 │     trace_fwhm_x_px                                                  │
 │     trace_flux_adu       — science (solid), comparison (dashed)      │
 │     sky_background_adu                                               │
+│     xcor_peak_value      — drops on cloud / template mismatch        │
 │     commands sent (RA, Dec)                                          │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -781,16 +791,17 @@ Single Tk window, layout:
 ### State machine
 
 ```
-IDLE ─ user draws boxes; ridge auto-fit shown ─►
-REFERENCE_PENDING ─ adjust ridge / bg boxes; click "Save Reference" ─►
-REFERENCE_SET ─ enter targets; click "Start Guiding" ─►
+IDLE ─ user draws stamp(s); no template yet ─►
+REFERENCE_PENDING ─ adjust stamp(s); a henNNNN.fits has arrived;
+                    click "Build Template" ─►
+REFERENCE_SET ─ template in memory; click "Start Guiding" ─►
 GUIDING ─ ALERTED auto-entered/exited on out-of-family ─►
 (STOP returns to REFERENCE_SET; PAUSE freezes commands without losing state)
 ```
 
-Across-target operation: STOP → slew TCS manually → take fresh first
-integration → click "Re-fit ridge" → REFERENCE_PENDING with the same boxes
-still drawn.
+Across-target operation: STOP → slew TCS manually → wait for the next
+`henNNNN.fits` (end of fresh first integration) → click "Build
+Template" → REFERENCE_PENDING with the same stamps still drawn.
 
 ### Watch directory
 
@@ -803,16 +814,16 @@ On change, regardless of starting state:
 
 1. Stop the `watchdog` observer.
 2. Clear the rolling SUTR buffer (no reads carry across).
-3. Discard the in-memory reference image and reference 1-D profile (they
-   were tied to the previous directory's frames).
+3. Discard the in-memory template (it was tied to the previous
+   directory's frames).
 4. Restart the observer on the new path.
 5. Persist `archon_watch_dir` to `session.toml`.
 6. Transition the state machine: from any of `REFERENCE_SET`, `GUIDING`,
    `ALERTED`, or `PAUSED`, the state drops to **`REFERENCE_PENDING`**;
-   from `IDLE`, it stays in `IDLE`. Box geometry, ridge coefficients, and
-   commandable targets are preserved (they are detector-frame quantities,
-   not directory-bound). The user must click "Save Reference" on a fresh
-   high-SNR frame from the new directory to resume guiding.
+   from `IDLE`, it stays in `IDLE`. Stamp geometry is preserved
+   (detector-frame and not directory-bound). The user must click "Build
+   Template" on a fresh `henNNNN.fits` from the new directory to resume
+   guiding.
 
 ### Settings dialog
 
@@ -821,18 +832,19 @@ On change, regardless of starting state:
 
 ### "Estimate K" tool
 
-Opens a modal dialog. Runs a Monte Carlo simulator on the current reference
-guide image:
+Opens a modal dialog. Runs a Monte Carlo simulator on the current
+template:
 
-1. Compute expected photoelectrons per pixel from the current diff image and
+1. Compute expected photoelectrons per pixel from the template (a
+   slope-fit `henNNNN.fits` already in memory) and
    `detector.gain_e_per_dn`.
 2. For `K ∈ {1, 2, 3, 4, 5}`:
-    - Build 50 noisy realisations of a K-window difference image, including
-      Poisson shot noise and read-noise scaled by `√(2/K)`.
-    - Run each realisation through the same ridge-relative measurement
-      pipeline used for guiding.
-3. Display a table `K → RMS(dx_px), RMS(dy_px)` and recommend the smallest
-   K with RMS below a configurable threshold.
+    - Build 50 noisy realisations of a K-window difference image,
+      including Poisson shot noise and read-noise scaled by `√(2/K)`.
+    - Run each realisation through the same 2-D xcor + parabolic-peak
+      pipeline used for live guiding (against the same template).
+3. Display a table `K → RMS(dx_px), RMS(dy_px)` and recommend the
+   smallest K with RMS below a configurable threshold.
 4. Click **Apply** to update the running K (writes `reduction.K` in
    `config.toml`).
 
@@ -849,8 +861,8 @@ Three severity levels surfacing just below the status bar:
 - **WARN** (yellow) — degraded but loop continues (e.g. TCS pacing throttle).
 - **ALERT** (orange) — out-of-family detected; commands suppressed; loop
   self-recovering.
-- **ERROR** (red) — file watcher stalled / TCS disconnected / ridge fit
-  failed. Requires user action.
+- **ERROR** (red) — file watcher stalled / TCS disconnected / template
+  build failed. Requires user action.
 
 ### Audio alert when guiding stops
 
@@ -880,8 +892,10 @@ sound:
   see §4 "Sequential-order sanity checks."
 - **TCS disconnect** — guiding can't proceed because commands are not
   reaching the telescope.
-- **ridge auto-fit failure on a Save Reference attempt** — a calibration
-  step needed before guiding can start.
+- **template build failure** — Build Template was clicked but the
+  source `henNNNN.fits` couldn't produce a usable template (read error,
+  too few unmasked pixels in the stamp, or zero variance after sky
+  subtraction).
 - **out-of-family ALERT entry** — guiding has paused; commands are
   suppressed pending self-recovery. Plays only on *entry* into the
   ALERTED state, not for each rejected frame, and not again on auto-
@@ -903,7 +917,7 @@ or `espeak`). If a subprocess fails, we log a `WARNING` and fall back to
 `widget.bell()`; the alert banner is unaffected.
 
 No audio is played for routine state changes (operator-driven STOP /
-PAUSE / Re-fit ridge), to avoid alert fatigue.
+PAUSE / Build Template), to avoid alert fatigue.
 
 ## 10. Logging
 
@@ -921,12 +935,12 @@ What gets logged:
 - `INFO`: lifecycle events (startup, shutdown, watch-dir change, reference
   saved, guiding started/stopped/paused/alerted), every G command actually
   sent, every alert condition triggered.
-- `DEBUG`: every diff image, ridge fits, COM measurements, dead-banded
+- `DEBUG`: every diff image, xcor peaks and curvatures, dead-banded
   errors, file events.
 - `WARNING`: unexpected filenames, TCS pacing throttles, mid-run mask file
   changes, malformed FITS headers.
-- `ERROR`: TCS connection drops, ridge fit failures, FITS read errors,
-  watcher death.
+- `ERROR`: TCS connection drops, template build failures, FITS read
+  errors, watcher death.
 
 The log is the second source of truth after SQLite for debugging.
 
@@ -944,16 +958,26 @@ The log is the second source of truth after SQLite for debugging.
 - `controller.step`: dead band, gain math, max-command clipping.
 - `reduce.framebuffer`: frame-boundary clearing, K=1/2/3, overlapping vs
   non-overlapping stride.
-- `centroid` on synthetic Gaussian-trace images with noise + bad pixels:
-  centroid within 0.05 px of injected truth; ridge fit recovers angle within
-  0.05°.
+- `measure.local_sky_subtraction`: synthetic stamp with known per-row
+  pedestal — recovers the pedestal to numerical precision; bad-pixel
+  mask correctly excludes flagged pixels from the row median.
+- `measure.xcor_2d` end-to-end on synthetic data: build a template, shift
+  it by a known sub-pixel `(dx, dy)`, add Poisson + read noise, push it
+  through the full pipeline (sky-sub + xcor + parabolic peak), assert
+  recovered shift within 0.1 px (X) and 0.05 px (Y) of injected truth on
+  bright synthetics.
+- `measure.xcor_2d` parabolic-peak edge cases: peak at the edge of the
+  search window (no neighbour), flat correlation surface (degenerate
+  curvature), single-pixel-wide peak.
 - `out_of_family` detector: trigger and auto-resume on synthetic series.
 
 ### Integration (`tests/integration/`)
 
-A `FakeArchon` writes a sequence of FITS frames into a tempdir using the
-atomic-rename pattern. The test launches the core in a thread, lets it
-process the sequence, and asserts:
+A `FakeArchon` writes a sequence of FITS frames into a tempdir,
+producing per-SUTR `henNNNN_sssr.fits` files at a configurable cadence
+plus a slope-fit `henNNNN.fits` at end of integration (no atomic rename
+— the watcher's settle-timer is exercised). The test launches the core
+in a thread, lets it process the sequence, and asserts:
 
 - expected SQLite rows exist;
 - expected G commands arrive at a `FakeTCS` (a `socket.socketpair`-based
@@ -975,13 +999,14 @@ enough that the heavy logic in `core/` is already covered.
 
 ### Cosmic rays (note rather than test)
 
-We rely on the multiple medianing operations in the pipeline to suppress
-CR contamination — sky median in two strips, robust sigma-clipped mean
-across rows for `dX`, the cross-correlation's broad peak fit for `dY`, and
-the running-stats out-of-family check for `flux` and `FWHM`. A CR has to
-survive (a) the bad-pixel mask, (b) per-row sigma-clipping, (c) the broad
-CC peak fit, and (d) the out-of-family check. Stacking those, dedicated CR
-detection adds little — and is therefore omitted in v1.
+We rely on the medianing in the pipeline to suppress CR contamination —
+the per-row sky median, the broad 2-D xcor peak fit (a single bright
+pixel barely moves the parabolic peak across an ~70 k-pixel stamp),
+and the running-stats out-of-family check for `flux` and `FWHM`. A CR
+has to survive (a) the bad-pixel mask, (b) the broad xcor peak fit,
+and (c) the out-of-family check before it can corrupt a guide command.
+Stacking those, dedicated CR detection adds little — and is therefore
+omitted in v1.
 
 ### CI
 
@@ -993,13 +1018,16 @@ GitHub Actions on push: `uv sync && make test && make lint`.
   controller and encoder. v1 spec: **uniform random draw** of `(dRA, dDec)`
   on `[-A, +A]` per axis (independent), redrawn each new integration when
   `_001` arrives. Default off.
-- **Absorption-feature Y-locking.** If cross-correlation Y is too noisy on
-  featureless continua, swap in a "lock to a chosen line" measurement: user
-  clicks a feature, system fits a Gaussian to it each frame. Slot in as an
-  alternative measurement strategy.
-- **Quadratic ridge.** `reduction.ridge_degree = 2` adds a `c2` coefficient
-  to the fit and to the SQLite schema.
-- **Multiple comparison boxes.** Schema already supports `box_id ≥ 2`.
+- **Sliding template by default.** v1 builds the template once per
+  Build-Template click; for long sequences, `reduction.sliding_template
+  = true` already replaces it on each new `henNNNN.fits`. Future work:
+  use a running average of the last N integrations for extra noise
+  suppression on faint sources.
+- **FFT-based xcor.** v1 uses brute-force xcor over a ±12 px window,
+  which is plenty fast at our stamp size. If we ever need a much larger
+  search radius (e.g., for acquisition-class moves), drop in
+  `scipy.signal.fftconvolve`-style FFT xcor.
+- **Multiple comparison stamps.** Schema already supports `stamp_id ≥ 2`.
 - **PI / PID controllers.** `Ki`, `Kd` already in config; needs the integral
   / derivative state machinery and anti-wind-up.
 - **TCS status channel.** If a status / pointing-readback protocol is
@@ -1008,8 +1036,8 @@ GitHub Actions on push: `uv sync && make test && make lint`.
   the GUI to a thin client. Useful only if remote operation or surviving
   GUI crashes ever become requirements.
 - **"Best K + best Y position" Monte Carlo sweep.** Extend the Estimate-K
-  dialog to sweep box position along the spectrum and recommend an optimum
-  location for the science box.
+  dialog to sweep stamp position along the spectrum and recommend an
+  optimum location for the science stamp.
 
 ## 13. Open questions
 
@@ -1017,12 +1045,15 @@ Tracked in `Questions-for-William.md` at the repo root. Summary by area:
 
 - TCS settle time, `guider_cmd_processing` semantics, status / telemetry
   channel availability, ACK behaviour.
-- Archon atomic-rename convention confirmation, output directory, FITS keyword
-  inventory (HA, Dec, PA, airmass, temperature, focus, exposure time, UTC),
-  intermediate-read availability (already confirmed: not available).
+- Archon file-write convention (in-place, no atomic rename — preliminary
+  William answer, to confirm), output directory, FITS keyword inventory
+  (HA, Dec, PA, airmass, temperature, focus, exposure time, UTC, OBJECT
+  for target-switch detection), intermediate-read availability (already
+  confirmed: not available).
 - Detector parameters: gain (placeholder 4 e⁻/DN), read noise, saturation
   (40000 DN), `y_middle_row`.
-- Bad-pixel mask source, format, lifecycle.
+- Bad-pixel mask source / lifecycle (format already confirmed via
+  `bpm_25apr2026.fits`: 7-HDU MEF, primary HDU is 1=good).
 - PA convention, plate scale, detector orientation parity.
 - Operations: who toggles `guider_cmd_processing`, behaviour around target
   acquisitions.

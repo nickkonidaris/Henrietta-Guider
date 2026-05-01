@@ -1,53 +1,25 @@
 # Henrietta-Guider — Brainstorm Status
 
-**Last updated:** 2026-05-01 (mid-session, paused for travel)
+**Last updated:** 2026-05-01 (post-flight resumption)
 
-## ⚠️ WIP: ridge → 2-D xcor algorithm rewrite is in progress
+## Status: ridge → 2-D xcor rewrite COMPLETE in the spec
 
-User placed `ALGORITHM.md` (2-D cross-correlation per `(read[k+1] −
-read[k])` against a template built from the slope-fit `henNNNN.fits` of
-the first integration), and asked to remove all ridge-fitting from the
-spec. The rewrite of §4 is **done** (Stamp geometry, Local sky
-subtraction, Template build, 2-D xcor measurement), but the **ripple
-effects in other sections are not yet applied**. Spec is currently
-internally inconsistent. Resume by finishing these:
+`grep -i ridge` on the spec is empty. All sections (§1–§13) now describe
+the 2-D cross-correlation algorithm consistently. The schema renames
+`box_measurements` → `stamp_measurements` with xcor-specific columns
+(`xcor_peak_value`, `xcor_curvature_x/y`, `template_frame_number`,
+stamp geometry).
 
-- **§4 Target-switch detection** (still uses old wording).
-- **§6 Loop wiring** diagram (says "ridge measurement").
-- **§7 Schema** — drop `ridge_x_center_px`, `ridge_angle_deg`; add
-  `xcor_curvature_x`, `xcor_curvature_y`, `xcor_peak_value`,
-  `template_frame_number`. Box columns become stamp columns
-  (`stamp_x_center`, `stamp_x_halfwidth`, `stamp_y_lo`, `stamp_y_hi`).
-- **§8 Config** — drop `ridge_degree`, `min_ridge_rows`,
-  `max_ridge_residual_px`, `max_ridge_angle_deg`. Add `stamp_x_halfwidth`,
-  `stamp_y_lo`, `stamp_y_hi`, `xcor_search_radius_px`,
-  `sliding_template`.
-- **§8 session.toml** — drop `[ridge]` section, drop `[targets]`, add
-  `[science_stamp]` and `[comparison_stamp]` (with `x_center`,
-  `x_halfwidth`, `y_lo`, `y_hi`).
-- **§9 GUI** — replace Ridge / Targets controls with Stamp / Template
-  controls. "Save Reference" → "Build Template." Drop "Edit ridge."
-  Update the layout diagram.
-- **§9 State machine** — remove "ridge auto-fit shown"; the new pre-
-  template state shows the empty-template stamp.
-- **§9 Watch-directory transition** — preserves stamp geometry instead
-  of ridge state.
-- **§9 Estimate K** — pipeline is now (template + xcor), not
-  (ridge-relative).
-- **§9 Audio alerts** — replace "ridge auto-fit failure" trigger with
-  "template build failure."
-- **§10 Logging** — DEBUG mentions "ridge fits"; ERROR mentions "ridge
-  fit failures."
-- **§11 Testing** — drop ridge-fit unit tests; add 2-D xcor + parabolic-
-  peak tests, including a synthetic shift-injection round-trip.
-- **§12 Future** — drop "Quadratic ridge" and "Absorption-feature
-  Y-locking" (xcor handles both).
-- **§13 Open questions** — drop ridge-related items.
-- **`mockups/gui_mockup.py`** — needs corresponding redraw (Ridge panel
-  → Stamp/Template panel).
+**Still to do before declaring the spec ready for the writing-plans
+skill:**
 
-After spec is internally consistent again, re-run the spec-document-
-reviewer.
+- Re-run the **spec-document-reviewer** for round 3 against the now-
+  consistent doc.
+- Update **`mockups/gui_mockup.py`** so the rendered PNG matches the
+  new GUI layout (Stamp/Template panel instead of Ridge controls;
+  `xcor_peak_value` time-series row).
+- After review passes: ask the user to read the spec, then invoke the
+  `writing-plans` skill.
 
 ## Findings during the rewrite
 
