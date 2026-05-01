@@ -395,44 +395,24 @@ science stamp (and optionally the comparison stamp) from that file,
 applies the BPM, and runs the local sky subtraction described above.
 The resulting bg-subtracted, masked stamp **is** the template `T(x, y)`.
 
-**Sliding (running-average) template — important for long sequences.**
-Henrietta's guide sequences run many hours; over that time the trace
-shape evolves slowly (changing water vapour, airmass, thermal drift,
-flexure) and a fixed template drifts behind those systematics. The
-autoguider therefore supports a **running-average sliding template**
-controlled by `reduction.sliding_template_n`:
+**Sliding template — single most-recent good frame.** Each
+`henNNNN.fits` is already a slope-fit across all that integration's
+SUTRs, so on its own it is a high-SNR representation of the trace. The
+autoguider keeps **one** template at a time: the most recent
+`henNNNN.fits` for which the build succeeded (no read error, enough
+unmasked pixels in the stamp, non-zero variance after sky subtraction).
+As new `henNNNN.fits` files arrive, each is offered for promotion; on
+success it replaces the active template, and on failure the previous
+template continues in use. This gives drift adaptation across a long
+night without any averaging machinery to manage.
 
-- `sliding_template_n == 0` — **fixed** template. The frame the user
-  built from is used unchanged for the rest of the session.
-- `sliding_template_n == 1` — **slide to latest**. Each new `henNNNN.fits`
-  replaces the active template.
-- `sliding_template_n == N > 1` — **running average of the most recent
-  N**. The autoguider keeps a FIFO ring buffer of the last N
-  bg-subtracted, masked stamps. The active template is their (unweighted)
-  mean. As each new `henNNNN.fits` arrives, its stamp is pushed onto
-  the ring (oldest dropped); the average is recomputed in place.
+When the user clicks **"Build Template"**, the most recent `henNNNN.fits`
+is taken (failing the request if none has arrived yet on the current
+target). After that click guiding can start immediately on that
+template; subsequent arrivals continue to refresh it automatically.
 
-A typical setting for many-hour runs is `sliding_template_n = 5–10`:
-enough to suppress per-integration noise yet short enough to track real
-shape evolution. Memory cost is small (8 MB × N at 2048×2048 BITPIX=16,
-even less for the cropped stamp).
-
-When the user clicks **"Build Template"**, the ring buffer is cleared
-and re-seeded with the most recent `henNNNN.fits`. The GUI shows the
-current fill state ("Template: 3 / 5 averaged") so the observer can
-tell when the average has saturated.
-
-The first frame after Build Template (i.e., when only one entry is in
-the ring) IS a usable template — guiding starts immediately. Subsequent
-arrivals just enrich the average.
-
-If no `henNNNN.fits` is available yet (e.g., the user clicks Build
-Template very early in the first integration), the GUI declines and
-prompts the user to wait for the slope-fit file to land.
-
-The template (and its ring buffer) are held in memory during a session
-and are **not** persisted across restarts — they must be re-built each
-time the autoguider starts.
+The template is held in memory only and is **not** persisted across
+restarts — it must be re-built each time the autoguider starts.
 
 ### Per-frame measurement (2-D cross-correlation)
 
@@ -744,11 +724,6 @@ Sections: `[loop]`, `[quality]`, `[reduction]`, `[files]`, `[tcs]`,
 - `reduction.stamp_y_lo = 600`, `reduction.stamp_y_hi = 1980`
   (filter cutoff to filter cutoff; tune per detector / filter)
 - `reduction.xcor_search_radius_px = 12`
-- `reduction.sliding_template_n = 5`
-  (number of recent `henNNNN.fits` to average into the active template:
-  `0` = fixed; `1` = slide to latest; `N > 1` = running average of last
-  N. Default 5 is a reasonable starting point for hours-long sequences;
-  retune empirically.)
 - `reduction.template_min_peak_value = 0.0`
   (minimum acceptable xcor peak value; below this the frame is flagged
   in `quality_flags`. Default 0 = no threshold; tune empirically.)
@@ -800,8 +775,7 @@ Single Tk window, layout:
 │                          │    y_lo:        __________ px             │
 │                          │    y_hi:        __________ px             │
 │                          │                                           │
-│                          │  Template:  built from hen0042.fits       │
-│                          │             avg: 3 / 5  N=[__5__] [Apply] │
+│                          │  Template:  hen0042.fits  (auto-refresh)  │
 │                          │             [Build Template]              │
 │                          │                                           │
 │                          │  Loop:     [START]  [STOP]  [PAUSE]       │
@@ -1047,11 +1021,12 @@ GitHub Actions on push: `uv sync && make test && make lint`.
   controller and encoder. v1 spec: **uniform random draw** of `(dRA, dDec)`
   on `[-A, +A]` per axis (independent), redrawn each new integration when
   `_001` arrives. Default off.
-- **Adaptive `sliding_template_n`.** v1 uses a fixed running-average
-  length set in config. Future work: auto-tune N based on the observed
-  noise of the per-frame `(dx_px, dy_px)` time series — shorter N when
-  the trace is changing fast (acquisition / weather), longer N when
-  stable. Off until commissioning shows it's needed.
+- **Running-average template.** v1 always uses the single most recent
+  good `henNNNN.fits` as the template. If commissioning shows that
+  per-integration noise on the template is dominating the centroid
+  precision, swap in a FIFO running-average of the last N integrations.
+  The schema and pipeline are designed to make this a contained change
+  in `core/measure.py`.
 - **FFT-based xcor.** v1 uses brute-force xcor over a ±12 px window,
   which is plenty fast at our stamp size. If we ever need a much larger
   search radius (e.g., for acquisition-class moves), drop in

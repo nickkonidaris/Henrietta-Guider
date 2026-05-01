@@ -14,6 +14,10 @@ from __future__ import annotations
 
 import os
 
+import matplotlib
+
+matplotlib.use("Agg")  # headless render — no GUI backend needed
+
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,27 +33,30 @@ OUT_PATH = os.path.join(os.path.dirname(__file__), "gui_mockup.png")
 def synth_image(
     nx: int = 220,
     ny: int = 1024,
-    ridge_x_center: float = 110.0,
-    ridge_angle_deg: float = 1.6,
+    trace_x_center: float = 110.0,
+    trace_tilt_deg: float = 1.6,
     fwhm_px: float = 3.5,
     rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """Build a fake guide-image: a tilted near-vertical trace with a couple
-    of absorption features, plus sky and noise."""
+    of absorption features, plus sky and noise.
+
+    The trace tilt is just for visual realism — the autoguider treats the
+    stamp as an opaque template and never fits a ridge.
+    """
     if rng is None:
         rng = np.random.default_rng(7)
     y_full = np.arange(ny) - ny // 2  # zero-centred at detector middle row
     x_grid = np.arange(nx)[None, :]
-    y_grid = np.arange(ny)[:, None]
 
-    angle_rad = np.deg2rad(ridge_angle_deg)
-    x_ridge = ridge_x_center + np.tan(angle_rad) * y_full
+    angle_rad = np.deg2rad(trace_tilt_deg)
+    x_trace = trace_x_center + np.tan(angle_rad) * y_full
 
     sigma = fwhm_px / 2.355
-    profile = np.exp(-((x_grid - x_ridge[:, None]) ** 2) / (2 * sigma**2))
+    profile = np.exp(-((x_grid - x_trace[:, None]) ** 2) / (2 * sigma**2))
 
     # Continuum modulation along Y (slow flux variation + a couple of
-    # narrow absorption features for visual interest)
+    # narrow absorption features for visual interest).
     cont = 1.0 + 0.15 * np.sin(np.linspace(0, 4.0, ny))
     cont -= 0.6 * np.exp(-((np.arange(ny) - 250) ** 2) / (2 * 8.0**2))
     cont -= 0.45 * np.exp(-((np.arange(ny) - 720) ** 2) / (2 * 12.0**2))
@@ -59,7 +66,7 @@ def synth_image(
     img += 60.0  # sky
     img += rng.normal(0, 12.0, size=img.shape)  # readout / shot noise
 
-    # A couple of "bad pixels" / cosmic-ish hits well outside the science box
+    # A couple of "bad pixels" / cosmic-ish hits well outside the science stamp
     img[120, 30] = 4500
     img[800, 200] = 5200
     return img
@@ -73,15 +80,16 @@ def synth_timeseries(n: int = 240, rng: np.random.Generator | None = None):
     dy = 0.03 * np.cos(t * 0.4) + rng.normal(0, 0.05, n)
     fwhm = 3.4 + 0.15 * np.sin(t * 0.3) + rng.normal(0, 0.05, n)
     flux = 1.8e5 * (1 + 0.04 * np.sin(t * 0.2)) + rng.normal(0, 4e3, n)
+    flux_cmp = 0.40 * flux + rng.normal(0, 1.5e3, n)
     sky = 60 + 0.4 * t + rng.normal(0, 1.5, n)
-    cmd_ra = -0.5 * dx                       # crude P controller for visual
-    cmd_dec = -0.5 * dy
+    # xcor peak value: dimensionless correlation peak — drops on cloud
+    xcor = 0.92 + rng.normal(0, 0.01, n)
 
     # Insert one out-of-family stretch (clouds) where flux drops & we ALERT
     flux[150:175] *= 0.35
-    cmd_ra[150:175] = np.nan
-    cmd_dec[150:175] = np.nan
-    return t, dx, dy, fwhm, flux, sky, cmd_ra, cmd_dec
+    flux_cmp[150:175] *= 0.35
+    xcor[150:175] *= 0.45  # xcor peak also drops sharply when clouded
+    return t, dx, dy, fwhm, flux, flux_cmp, sky, xcor
 
 
 # ---------------------------------------------------------------------------
@@ -90,13 +98,13 @@ def synth_timeseries(n: int = 240, rng: np.random.Generator | None = None):
 
 def render():
     img = synth_image()
-    t, dx, dy, fwhm, flux, sky, cmd_ra, cmd_dec = synth_timeseries()
+    t, dx, dy, fwhm, flux, flux_cmp, sky, xcor = synth_timeseries()
 
-    fig = plt.figure(figsize=(15.5, 11.0), facecolor="#ECECEC")
+    fig = plt.figure(figsize=(15.5, 12.0), facecolor="#ECECEC")
     gs = GridSpec(
-        nrows=8,
+        nrows=9,
         ncols=2,
-        height_ratios=[0.6, 4.5, 4.5, 0.5, 1.05, 1.05, 1.05, 1.05],
+        height_ratios=[0.6, 4.5, 4.5, 0.5, 0.92, 0.92, 0.92, 0.92, 0.92],
         width_ratios=[3.4, 2.2],
         hspace=0.45,
         wspace=0.10,
@@ -109,13 +117,14 @@ def render():
     ax_status.set_xticks([]); ax_status.set_yticks([])
     for s in ax_status.spines.values():
         s.set_edgecolor("#888"); s.set_linewidth(0.6)
-    # Three "indicators"
+
     def dot(ax, x, color, label):
         ax.add_patch(mpatches.Circle(
             (x, 0.5), 0.07, transform=ax.transAxes, color=color, zorder=3,
             ec="#333", lw=0.4))
         ax.text(x + 0.018, 0.5, label, transform=ax.transAxes,
                 va="center", ha="left", fontsize=9.5)
+
     dot(ax_status, 0.018, "#3aa55d", "TCS connected")
     dot(ax_status, 0.16,  "#3aa55d", "Watcher  4.2 s ago")
     dot(ax_status, 0.34,  "#3aa55d", "State: GUIDING")
@@ -141,29 +150,52 @@ def render():
     ax_img.set_xlabel("X (px)"); ax_img.set_ylabel("Y (px)")
     ax_img.tick_params(labelsize=8)
 
-    # Boxes
-    sci = mpatches.Rectangle((85, 100), 50, 824, ec="#E63946",
-                             fc="none", lw=1.6, label="science box")
-    bgL = mpatches.Rectangle((25, 100), 55, 824, ec="#F2A65A",
-                             fc="none", lw=1.0, ls="--",
-                             label="science bg L")
-    bgR = mpatches.Rectangle((140, 100), 55, 824, ec="#F2A65A",
-                             fc="none", lw=1.0, ls="--",
-                             label="science bg R")
-    ax_img.add_patch(sci); ax_img.add_patch(bgL); ax_img.add_patch(bgR)
+    # Stamps. Science stamp covers the whole illuminated stripe (Y wide,
+    # X snug ±25 around the trace). No flanking bg boxes — the autoguider
+    # subtracts row-by-row local sky from the outer 1/6 of the stamp itself.
+    sci_stamp = mpatches.Rectangle(
+        (85, 50), 50, 924,
+        ec="#E63946", fc="none", lw=1.6, label="science stamp",
+    )
+    ax_img.add_patch(sci_stamp)
+    # Annotate the outer 1/6 sky bands inside the stamp
+    edge_w = 50 // 6
+    sky_left = mpatches.Rectangle(
+        (85, 50), edge_w, 924,
+        ec="none", fc="#E63946", alpha=0.10,
+    )
+    sky_right = mpatches.Rectangle(
+        (85 + 50 - edge_w, 50), edge_w, 924,
+        ec="none", fc="#E63946", alpha=0.10,
+    )
+    ax_img.add_patch(sky_left); ax_img.add_patch(sky_right)
+    ax_img.text(
+        85 + edge_w / 2, 990, "sky", color="#E63946",
+        fontsize=7, ha="center", va="bottom", alpha=0.85,
+    )
+    ax_img.text(
+        85 + 50 - edge_w / 2, 990, "sky", color="#E63946",
+        fontsize=7, ha="center", va="bottom", alpha=0.85,
+    )
 
-    # Comparison box (smaller, lower SNR region)
-    cmp_ = mpatches.Rectangle((95, 940), 30, 70, ec="#5BC0EB",
-                              fc="none", lw=1.4, label="comparison box")
-    ax_img.add_patch(cmp_)
+    # Comparison stamp (smaller, lower SNR region)
+    cmp_stamp = mpatches.Rectangle(
+        (95, 770), 30, 200,
+        ec="#5BC0EB", fc="none", lw=1.4, label="comparison stamp",
+    )
+    ax_img.add_patch(cmp_stamp)
 
-    # Ridge line overlay (matches the synthetic ridge_x_center=110, angle=1.6°)
-    yy = np.arange(100, 924, 2)
-    xx = 110.0 + np.tan(np.deg2rad(1.6)) * (yy - img.shape[0] // 2)
-    ax_img.plot(xx, yy, color="#E63946", lw=0.9, alpha=0.85, label="ridge")
-    # Two ridge handles (visualization of edit mode)
-    ax_img.scatter([xx[5], xx[-5]], [yy[5], yy[-5]],
-                   s=42, c="#E63946", ec="white", lw=0.9, zorder=5)
+    # Template thumbnail inset (small) — show what the template looks like
+    inset = ax_img.inset_axes([0.79, 0.04, 0.18, 0.30])
+    inset.imshow(
+        img[50:974, 85:135],
+        origin="lower", cmap="viridis", vmin=vlo, vmax=vhi,
+        aspect="auto", interpolation="nearest",
+    )
+    inset.set_xticks([]); inset.set_yticks([])
+    for s in inset.spines.values():
+        s.set_edgecolor("#E63946"); s.set_linewidth(1.2)
+    inset.set_title("template (hen0042)", fontsize=7, color="#E63946", pad=2)
 
     ax_img.legend(loc="upper right", fontsize=7.5, framealpha=0.85)
 
@@ -179,10 +211,13 @@ def render():
         ax.text(0.04, y, title, transform=ax.transAxes,
                 fontsize=10.5, fontweight="bold", color="#222")
 
-    def button(ax, x, y, w, h, label, primary=False):
-        face = "#1f6feb" if primary else "#FFFFFF"
-        edge = "#1f6feb" if primary else "#666"
-        text_color = "white" if primary else "#222"
+    def button(ax, x, y, w, h, label, primary=False, disabled=False):
+        if disabled:
+            face, edge, text_color = "#E5E5E5", "#BBB", "#999"
+        elif primary:
+            face, edge, text_color = "#1f6feb", "#1f6feb", "white"
+        else:
+            face, edge, text_color = "#FFFFFF", "#666", "#222"
         ax.add_patch(mpatches.FancyBboxPatch(
             (x, y), w, h,
             boxstyle="round,pad=0.005,rounding_size=0.012",
@@ -190,53 +225,57 @@ def render():
         ax.text(x + w / 2, y + h / 2, label, transform=ax.transAxes,
                 va="center", ha="center", fontsize=9, color=text_color)
 
-    def field(ax, x, y, w, h, label, value):
+    def field(ax, x, y, w, h, label, value, label_w=0.38):
         ax.text(x, y + h / 2, label, transform=ax.transAxes,
                 va="center", ha="left", fontsize=9, color="#333")
         ax.add_patch(mpatches.Rectangle(
-            (x + 0.42, y), w, h, transform=ax.transAxes,
+            (x + label_w, y), w, h, transform=ax.transAxes,
             facecolor="white", edgecolor="#888", lw=0.6))
-        ax.text(x + 0.42 + w - 0.012, y + h / 2, value, transform=ax.transAxes,
+        ax.text(x + label_w + w - 0.012, y + h / 2, value, transform=ax.transAxes,
                 va="center", ha="right", fontsize=9, color="#222",
                 family="monospace")
 
-    # Boxes section
-    section(ax_ctrl, 0.965, "Boxes")
+    # Stamps section
+    section(ax_ctrl, 0.965, "Stamps")
     button(ax_ctrl, 0.04, 0.910, 0.30, 0.040, "Draw science")
     button(ax_ctrl, 0.36, 0.910, 0.30, 0.040, "Add comparison")
-    button(ax_ctrl, 0.04, 0.860, 0.30, 0.040, "Reset bg boxes")
+    button(ax_ctrl, 0.04, 0.860, 0.30, 0.040, "Reset to defaults")
 
-    # Ridge section
-    section(ax_ctrl, 0.815, "Ridge")
-    field(ax_ctrl, 0.04, 0.770, 0.22, 0.038, "angle (deg):", "1.62")
-    field(ax_ctrl, 0.04, 0.722, 0.22, 0.038, "x_center (px):", "110.42")
-    button(ax_ctrl, 0.04, 0.668, 0.20, 0.040, "Auto-fit")
-    button(ax_ctrl, 0.26, 0.668, 0.18, 0.040, "Edit")
-    button(ax_ctrl, 0.46, 0.668, 0.30, 0.040, "Save reference", primary=True)
+    # Stamp geometry section
+    section(ax_ctrl, 0.815, "Stamp geometry (science)")
+    field(ax_ctrl, 0.04, 0.770, 0.22, 0.038, "x_center:",     "110 px")
+    field(ax_ctrl, 0.04, 0.722, 0.22, 0.038, "x_halfwidth:",  " 25 px")
+    field(ax_ctrl, 0.04, 0.674, 0.22, 0.038, "y_lo:",         "600 px")
+    field(ax_ctrl, 0.04, 0.626, 0.22, 0.038, "y_hi:",         "1980 px")
 
-    # Targets section
-    section(ax_ctrl, 0.615, "Targets (commandable)")
-    field(ax_ctrl, 0.04, 0.570, 0.30, 0.038, "desired ridge_x:", "110.42")
-    field(ax_ctrl, 0.04, 0.522, 0.30, 0.038, "desired ridge_y:", "512.00")
+    # Template section
+    section(ax_ctrl, 0.575, "Template")
+    ax_ctrl.text(0.04, 0.530, "current: hen0042.fits",
+                 transform=ax_ctrl.transAxes,
+                 va="center", ha="left", fontsize=9, color="#333")
+    ax_ctrl.text(0.04, 0.495, "auto-refreshes on each new henNNNN.fits",
+                 transform=ax_ctrl.transAxes,
+                 va="center", ha="left", fontsize=8.5, color="#777",
+                 fontstyle="italic")
+    button(ax_ctrl, 0.04, 0.440, 0.92, 0.040, "Build Template", primary=True)
 
     # Loop section
-    section(ax_ctrl, 0.460, "Loop")
-    button(ax_ctrl, 0.04, 0.405, 0.40, 0.052, "START GUIDING", primary=True)
-    button(ax_ctrl, 0.46, 0.405, 0.20, 0.052, "STOP")
-    button(ax_ctrl, 0.68, 0.405, 0.26, 0.052, "PAUSE")
+    section(ax_ctrl, 0.395, "Loop")
+    button(ax_ctrl, 0.04, 0.336, 0.40, 0.052, "START GUIDING", primary=True)
+    button(ax_ctrl, 0.46, 0.336, 0.20, 0.052, "STOP")
+    button(ax_ctrl, 0.68, 0.336, 0.26, 0.052, "PAUSE")
 
     # Live readouts
-    section(ax_ctrl, 0.345, "Live readouts")
-    field(ax_ctrl, 0.04, 0.300, 0.30, 0.038, "current dx:", "+0.04 px")
-    field(ax_ctrl, 0.04, 0.255, 0.30, 0.038, "current dy:", "-0.02 px")
-    field(ax_ctrl, 0.04, 0.210, 0.30, 0.038, "trace FWHM:", "3.42 px")
-    field(ax_ctrl, 0.04, 0.165, 0.30, 0.038, "trace flux:", "1.84e5 ADU")
-    field(ax_ctrl, 0.04, 0.120, 0.30, 0.038, "sky bg:", "62.1 ADU")
+    section(ax_ctrl, 0.282, "Live readouts")
+    field(ax_ctrl, 0.04, 0.230, 0.30, 0.036, "current dx:",    "+0.04 px")
+    field(ax_ctrl, 0.04, 0.185, 0.30, 0.036, "current dy:",    "-0.02 px")
+    field(ax_ctrl, 0.04, 0.140, 0.30, 0.036, "trace FWHM:",    "3.42 px")
+    field(ax_ctrl, 0.04, 0.095, 0.30, 0.036, "xcor peak:",     "0.927")
 
     # Tools
-    section(ax_ctrl, 0.062, "Tools")
-    button(ax_ctrl, 0.04, 0.012, 0.30, 0.040, "Estimate K…")
-    button(ax_ctrl, 0.36, 0.012, 0.30, 0.040, "Settings…")
+    section(ax_ctrl, 0.048, "Tools")
+    button(ax_ctrl, 0.04, 0.005, 0.30, 0.034, "Estimate K…")
+    button(ax_ctrl, 0.36, 0.005, 0.30, 0.034, "Settings…")
 
     # ---- alerts banner (row 3) ---------------------------------------------
     ax_alert = fig.add_subplot(gs[3, :])
@@ -254,14 +293,15 @@ def render():
     ax_alert.text(0.984, 0.5, "✕  dismiss", transform=ax_alert.transAxes,
                   va="center", ha="right", fontsize=9, color="#3a2a10")
 
-    # ---- time series (rows 4-7) --------------------------------------------
+    # ---- time series (rows 4-8) --------------------------------------------
     series = [
-        ("dx, dy (px)",            [(t, dx, "dx", "#1f77b4"),
-                                    (t, dy, "dy", "#d62728")]),
-        ("FWHM (px)",              [(t, fwhm, None, "#2ca02c")]),
-        ("trace flux (ADU)",       [(t, flux, "science", "#9467bd")]),
-        ("commands (arcsec)",      [(t, cmd_ra, "RA",  "#1f77b4"),
-                                    (t, cmd_dec, "Dec", "#d62728")]),
+        ("dx, dy (px)",              [(t, dx, "dx", "#1f77b4"),
+                                      (t, dy, "dy", "#d62728")]),
+        ("FWHM (px)",                [(t, fwhm, None, "#2ca02c")]),
+        ("trace flux (ADU)",         [(t, flux,     "science",    "#9467bd"),
+                                      (t, flux_cmp, "comparison", "#9467bd")]),
+        ("sky bg (ADU)",             [(t, sky, None, "#7f7f7f")]),
+        ("xcor peak",                [(t, xcor, None, "#e377c2")]),
     ]
 
     for i, (ylabel, traces) in enumerate(series):
@@ -269,10 +309,12 @@ def render():
         ax.set_facecolor("#FFFFFF")
         for s in ax.spines.values():
             s.set_edgecolor("#999"); s.set_linewidth(0.5)
-        # Mark the alerted region
         ax.axvspan(t[150], t[174], color="#F2A65A", alpha=0.18, lw=0)
         for tx, ty, lab, col in traces:
-            ax.plot(tx, ty, color=col, lw=1.0, label=lab)
+            if lab == "comparison":
+                ax.plot(tx, ty, color=col, lw=0.8, ls="--", label=lab)
+            else:
+                ax.plot(tx, ty, color=col, lw=1.0, label=lab)
         if any(lab for _, _, lab, _ in traces):
             ax.legend(loc="upper right", fontsize=7.5, ncol=2, framealpha=0.85)
         if i == 0:
