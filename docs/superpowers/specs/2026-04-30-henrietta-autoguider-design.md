@@ -825,7 +825,11 @@ Single Tk window, layout:
 ├──────────────────────────────────────────────────────────────────────┤
 │   Per-pixel SNR histogram (current frame, science stamp):            │
 │     X = √(signal_DN · gain),  Y = pixel count                        │
-│     vertical guides at SNR = 1, 5; redraws on every guide image      │
+│     vertical guides at SNR = 1, 5                                    │
+│     Gaussian reference overlay: mean μ = median SNR (typical signal),│
+│       σ = MAD-derived spread (~ noise scale). Lets the operator see  │
+│       at a glance how Gaussian-like the bulk of the distribution is. │
+│     Redraws on every guide image.                                    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 

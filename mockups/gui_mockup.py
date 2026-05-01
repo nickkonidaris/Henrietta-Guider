@@ -352,23 +352,47 @@ def render():
     ax_hist.set_facecolor("#FFFFFF")
     for s in ax_hist.spines.values():
         s.set_edgecolor("#999"); s.set_linewidth(0.5)
+
     bins = np.linspace(0, snr.max() * 1.05, 80)
-    ax_hist.hist(snr, bins=bins, color="#4c78a8", edgecolor="#274860",
-                 linewidth=0.4)
+    counts, edges, _ = ax_hist.hist(
+        snr, bins=bins, color="#4c78a8", edgecolor="#274860",
+        linewidth=0.4,
+    )
+
+    # Gaussian reference overlay: μ = median SNR, σ = MAD-based scale
+    mu_typ    = float(np.median(snr))
+    mad       = float(np.median(np.abs(snr - mu_typ)))
+    sigma_n   = mad * 1.4826 if mad > 0 else float(np.std(snr))
+    bin_w     = edges[1] - edges[0]
+    x_g       = np.linspace(edges[0], edges[-1], 600)
+    # Scale the Gaussian to peak at the same height as a Gaussian with this
+    # σ would, given the total counts (so it visually "matches" the data
+    # density rather than the histogram peak).
+    g_density = (1.0 / (sigma_n * np.sqrt(2 * np.pi))) * np.exp(
+        -0.5 * ((x_g - mu_typ) / sigma_n) ** 2
+    )
+    g_scaled  = g_density * snr.size * bin_w
+    ax_hist.plot(x_g, g_scaled, color="#E63946", lw=1.6,
+                 label=fr"reference $\mathcal{{N}}(\mu={mu_typ:.1f},\,\sigma={sigma_n:.1f})$")
+
     ax_hist.axvline(1.0,  color="#888", lw=0.7, ls=":")
     ax_hist.axvline(5.0,  color="#888", lw=0.7, ls=":")
     ax_hist.text(1.0,  ax_hist.get_ylim()[1] * 0.92, " SNR=1",
                  color="#666", fontsize=7.5, va="top")
     ax_hist.text(5.0,  ax_hist.get_ylim()[1] * 0.92, " SNR=5",
                  color="#666", fontsize=7.5, va="top")
-    ax_hist.set_xlabel(r"per-pixel SNR  =  $\sqrt{\mathrm{signal\_DN}\,\cdot\,\mathrm{gain}}$",
-                       fontsize=8.5)
+    ax_hist.set_xlabel(
+        r"per-pixel SNR  =  $\sqrt{\mathrm{signal\_DN}\,\cdot\,\mathrm{gain}}$",
+        fontsize=8.5,
+    )
     ax_hist.set_ylabel("pixels", fontsize=8.5)
+    p10 = float(np.percentile(snr, 10))
     ax_hist.set_title(
-        "Per-pixel SNR histogram — current frame, science stamp "
-        "(median 81.4,  10th-percentile 49.0)",
+        f"Per-pixel SNR histogram — current frame, science stamp "
+        f"(median {mu_typ:.1f},  10th-percentile {p10:.1f})",
         fontsize=9, loc="left", color="#222", pad=4,
     )
+    ax_hist.legend(loc="upper right", fontsize=8, framealpha=0.85)
     ax_hist.tick_params(labelsize=7.5)
 
     fig.suptitle(
