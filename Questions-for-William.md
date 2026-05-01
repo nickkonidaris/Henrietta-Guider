@@ -56,6 +56,18 @@ Last updated: 2026-04-30
     or -RA at PA=0 (and similarly for Y vs Dec)? Off-by-180 mistakes here are
     classic.
 
+## Bad pixel mask
+
+17. **Source and location.** Where does the bad-pixel mask come from
+    (calibration pipeline product, hand-curated, regenerated per night)?
+    What path is it written to, and is it expected to be stable across an
+    observing run?
+18. **Format.** FITS image with the same shape as the science frame? Boolean
+    (0=good, 1=bad) or bit-encoded (different categories of badness)? Single
+    extension or MEF?
+19. **Lifecycle.** Does it ever change mid-night (e.g., new hot pixels found),
+    or is it loaded once at startup?
+
 ## Operations
 
 15. **`guider_cmd_processing` enable/disable in operations.** Who toggles it,
