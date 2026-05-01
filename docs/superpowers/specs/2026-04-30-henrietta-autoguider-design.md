@@ -153,9 +153,15 @@ files are produced per integration.
 ### Stale-frame watchdog
 
 A timer in the worker thread tracks elapsed time since the last accepted
-frame. If it exceeds `quality.stale_frame_timeout_s` (default 30 s), an
-`ERROR`-level alert "Guiding has stopped — no frames received" is raised
-and guiding is paused until frames resume.
+guide image. If it exceeds `quality.stale_frame_timeout_s` (default 30 s),
+an `ERROR`-level alert "Guiding has stopped — no frames received" is
+raised and guiding is paused until frames resume.
+
+The timer is **gated**: it only starts running once at least one guide
+image has been accepted, and it is **reset** whenever the watch directory
+is changed and on the first accepted guide image after a frame-number
+boundary (so the inevitable warm-up delay of ~`2K` reads on a new target
+does not falsely trip the alert).
 
 ### SUTR difference model
 
@@ -256,6 +262,25 @@ final `_sss` of the first integration on a target):
 5. Store all of the above as the **reference** for this target; persist
    `(ridge_x_center, ridge_angle_deg)` in `session.toml`.
 
+#### Auto-fit acceptance criterion and failure handling
+
+A ridge fit is **accepted** if all of the following hold:
+
+- The number of rows with a successful per-row centroid (SNR above a
+  configurable threshold, default 5σ over sky noise) is at least
+  `reduction.min_ridge_rows` (default 20).
+- The median absolute residual `|X_centroid(Y) − X_ridge(Y)|` over those
+  rows is below `reduction.max_ridge_residual_px` (default 0.5 px).
+- The fit's matrix is non-singular and the recovered angle is within
+  `reduction.max_ridge_angle_deg` of vertical (default ±10°).
+
+If any check fails, the GUI emits an `ERROR`-level banner ("Ridge auto-fit
+failed: <reason>") and remains in **IDLE**. The user can then either
+redraw the box on a cleaner region, manually enter `(ridge_x_center,
+ridge_angle_deg)`, or click two trace points and re-fit. The state machine
+transitions to `REFERENCE_PENDING` only when a fit is either auto-accepted
+or manually saved.
+
 Manual override: the GUI lets the user adjust `ridge_x_center` and
 `ridge_angle_deg` by direct numeric entry, by dragging two handles on the
 ridge overlay, or by clicking two points along the visible trace and
@@ -310,16 +335,27 @@ of:
 - `sky_background_adu`
 - `dx_px`, `dy_px`
 
-If any new measurement deviates from its running median by more than
-`quality.out_of_family_sigma` MAD-sigma (default 5):
+**Warm-up.** Out-of-family checks are gated on having collected at least
+`quality.out_of_family_warmup_n` in-family frames (default 10). Before warm-
+up completes, frames are recorded normally and never trigger `ALERTED`,
+even on extreme values; the running statistics are simply being seeded.
+
+If any new measurement (post-warm-up) deviates from its running median by
+more than `quality.out_of_family_sigma` MAD-sigma (default 5):
 
 - `quality_flags["out_of_family"]` lists the offending metrics.
 - `guiding_state` becomes `ALERTED`.
 - **No `G` command is issued for that frame.**
 - The GUI raises an `ALERT`-level banner and (optionally) an audible bell.
 - After `quality.auto_resume_in_family` consecutive in-family frames
-  (default 3), state returns to `LOCKED` automatically. Otherwise the user
+  (default 3), state returns to `GUIDING` automatically. Otherwise the user
   must intervene.
+
+**Controller state during ALERTED.** v1 uses a pure-P controller, which is
+stateless, so there is nothing to freeze. When PI/PID is added later, the
+integral and derivative accumulators **freeze** while `ALERTED` (do not
+update with the rejected error, do not zero) and resume on the first
+in-family frame. This avoids both wind-up and a discontinuity on resume.
 
 The comparison box runs identical statistics independently — purely
 diagnostic.
@@ -401,6 +437,13 @@ def encode_command(ra_arcsec, dec_arcsec) -> bytes:
     return f"G{xx:02d}{yy:02d}\r".encode("ascii")
 ```
 
+**Asymmetry note.** The wire range is `−2.45″ .. +2.50″` (49 negative
+steps vs. 50 positive). To keep the controller's behaviour symmetric in
+sign, `loop.max_command_arcsec` is set to **`2.45`** by default — values
+beyond `±2.45″` are clipped *before* encoding, so a `−2.50″` controller
+output cannot silently lose 0.05″. The encoder still clamps to the wire
+range as a defence in depth.
+
 ### Connection lifecycle
 
 `TCSClient` runs its own state machine: `DISCONNECTED → CONNECTING →
@@ -439,7 +482,11 @@ file event → diff image → ridge measurement (science + comparison)
 ## 7. Data store
 
 Single SQLite database (`files.sqlite_db`, default
-`~/.henrietta_guider/henrietta_guider.db`), WAL mode, two tables:
+`~/.henrietta_guider/henrietta_guider.db`), WAL mode, two tables. Writes
+are issued synchronously from the worker thread but use SQLite's default
+WAL durability (no per-row `fsync`); a crash may lose the last few rows,
+which is acceptable — the `frames` table is for retrospective analysis,
+not as a transactional system of record for control.
 
 ```sql
 CREATE TABLE frames (
@@ -454,8 +501,9 @@ CREATE TABLE frames (
     airmass            REAL,
     temperature_c      REAL,
     focus_position     REAL,
-    cmd_ra_arcsec      REAL,
-    cmd_dec_arcsec     REAL,
+    cmd_ra_arcsec      REAL,         -- value sent (0 if dead-banded), NULL if not sent
+    cmd_dec_arcsec     REAL,         -- value sent (0 if dead-banded), NULL if not sent
+    cmd_suppressed_by  TEXT,         -- NULL = sent, else 'pacing'|'deadband'|'alerted'|'tcs_disconnected'
     err_ra_arcsec      REAL,
     err_dec_arcsec     REAL,
     guiding_state      TEXT,
@@ -499,18 +547,24 @@ or the `core/config.py` schema for the canonical default values.
 
 `~/.config/henrietta_guider/config.toml`
 
+The canonical schema lives in `core/config.py` as a tree of dataclasses.
 Sections: `[loop]`, `[quality]`, `[reduction]`, `[files]`, `[tcs]`,
 `[detector]`, `[display]`. Notable defaults:
 
 - `loop.Kp_ra = loop.Kp_dec = 0.5`
 - `loop.deadband_arcsec = 0.025`
-- `loop.max_command_arcsec = 2.50`
+- `loop.max_command_arcsec = 2.45`  (symmetric within the wire range
+  −2.45″..+2.50″; see §6 encoder note)
 - `loop.pacing_interval_s = 5.0` (placeholder; final from William)
 - `quality.out_of_family_window = 20`
+- `quality.out_of_family_warmup_n = 10`
 - `quality.out_of_family_sigma = 5.0`
 - `quality.auto_resume_in_family = 3`
 - `quality.stale_frame_timeout_s = 30.0`
 - `reduction.K = 1`, `reduction.stride = 1`, `reduction.ridge_degree = 1`
+- `reduction.min_ridge_rows = 20`
+- `reduction.max_ridge_residual_px = 0.5`
+- `reduction.max_ridge_angle_deg = 10.0`
 - `detector.y_middle_row = 1024` (placeholder)
 - `detector.gain_e_per_dn = 4.0` (placeholder)
 - `detector.read_noise_e = 12.0` (placeholder)
@@ -584,9 +638,23 @@ still drawn.
 
 Opens an OS-native folder picker (`tkinter.filedialog.askdirectory`) at
 startup if the previously-saved `daq_watch_dir` doesn't exist, and on demand
-via the **[Change…]** button in the status bar. On change: stop the
-`watchdog` observer, clear the rolling SUTR buffer, restart the observer on
-the new path, persist to `session.toml`.
+via the **[Change…]** button in the status bar. The button is enabled in
+**every** state, including `GUIDING`.
+
+On change, regardless of starting state:
+
+1. Stop the `watchdog` observer.
+2. Clear the rolling SUTR buffer (no reads carry across).
+3. Discard the in-memory reference image and reference 1-D profile (they
+   were tied to the previous directory's frames).
+4. Restart the observer on the new path.
+5. Persist `daq_watch_dir` to `session.toml`.
+6. Transition the state machine: from any of `REFERENCE_SET`, `GUIDING`,
+   `ALERTED`, or `PAUSED`, the state drops to **`REFERENCE_PENDING`**;
+   from `IDLE`, it stays in `IDLE`. Box geometry, ridge coefficients, and
+   commandable targets are preserved (they are detector-frame quantities,
+   not directory-bound). The user must click "Save Reference" on a fresh
+   high-SNR frame from the new directory to resume guiding.
 
 ### Settings dialog
 
@@ -657,7 +725,9 @@ The log is the second source of truth after SQLite for debugging.
 
 - `tcs_client.encode_command`: tabular tests including ±2.50″, just-out-of-
   range, sub-step rounding. Round-trip against a Python re-implementation of
-  the C++ parser to be sure the two agree on every value.
+  the C++ parser to be sure the two agree on every value. Property test:
+  `decode(encode(x)) == round(x / 0.05) * 0.05` for every `x` in
+  `[-2.45″, +2.50″]` at 0.001″ steps.
 - `geometry.detector_to_sky`: PA sweep 0–360°, identity at PA=0 and 90°,
   parity-flip checks.
 - `controller.step`: dead band, gain math, max-command clipping.
