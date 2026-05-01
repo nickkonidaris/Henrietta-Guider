@@ -14,17 +14,45 @@
 
 ## Pre-flight
 
-Before starting any task:
+Before starting any task, verify the working environment:
 
-- [ ] Confirm the spec is final and committed:
-  `docs/superpowers/specs/2026-04-30-henrietta-autoguider-design.md`
-- [ ] Confirm sample SUTR data exists (gitignored):
-  `test/hen1764_*.fits` (24 files), `test/hen1765_*.fits` (24 files)
-- [ ] Confirm the BPM is present at the repo root:
-  `bpm_25apr2026.fits` (28 MB; gitignored via `bpm_*.fits` pattern)
-- [ ] Confirm `Wireformat.md`, `ALGORITHM.md`, `Questions-for-William.md` are committed at the repo root.
+- [ ] **Git is initialised and configured.**
+  - `git rev-parse --git-dir` → prints `.git` (not an error).
+  - `git config user.name` and `git config user.email` are both set; if not, run `git config --global user.name "..."` and `git config --global user.email "..."`.
+  - `git remote -v` shows the GitHub remote (`https://github.com/nickkonidaris/Henrietta-Guider.git`); if not, run `git remote add origin <url>` first.
+  - `git branch --show-current` is `main` and tracks `origin/main`.
 
-If any are missing, stop and reconcile with the user before proceeding.
+- [ ] **`uv` is installed and recent.**
+  - `uv --version` prints **0.5.0 or later** (the plan uses `[dependency-groups]`, a uv 0.5+ feature).
+  - If older, install/upgrade via `curl -LsSf https://astral.sh/uv/install.sh | sh`, then `exec $SHELL` and retry.
+
+- [ ] **The Python build is the GIL build (not free-threaded).**
+  - After Task 1.1 finishes (or right now if the venv exists), run:
+    `uv run python -c "import sys; assert not sys._is_gil_enabled() is False, 'free-threaded build detected'"`
+    Actually a cleaner check: `uv run python -c "import sys; print('free-threaded' if hasattr(sys, '_is_gil_enabled') and not sys._is_gil_enabled() else 'GIL'); import sysconfig; print(sysconfig.get_config_var('Py_GIL_DISABLED'))"`
+    Expected: `GIL` and `0` (or `None`). The free-threaded build prints `free-threaded` and `1`.
+  - If free-threaded: re-pin in `.python-version` to `3.14.X` (a specific patch known to be the regular build) or run `uv python install --no-bundled 3.14` and pick the GIL variant explicitly.
+
+- [ ] **Spec, algorithm, wire format, and questions doc are committed:**
+  - `docs/superpowers/specs/2026-04-30-henrietta-autoguider-design.md`
+  - `ALGORITHM.md`, `Wireformat.md`, `Questions-for-William.md` at the repo root.
+
+- [ ] **Sample SUTR data exists (gitignored)**:
+  - `test/hen1764_*.fits` (24 files: 23 SUTR raw reads + 1 slope-fit final).
+  - `test/hen1765_*.fits` (same shape).
+  - If absent: copy from `/Volumes/Extreme Pro/Henrietta/hen176{4,5}*.fits` into `test/`.
+
+- [ ] **The BPM is present at the repo root (gitignored)**:
+  - `bpm_25apr2026.fits` (28 MB; `bpm_*.fits` is in `.gitignore`).
+  - If absent: copy from `/Volumes/Extreme Pro/bpm_25apr2026.fits`.
+
+- [ ] **`.gitignore` already covers the runtime artifacts.** Confirm it contains at minimum: `.venv/`, `__pycache__/`, `.pytest_cache/`, `.ruff_cache/`, `test/`, `bpm_*.fits`, `*.fits`. If any are missing, add them now and commit before starting Chunk 1.
+
+If any check fails, stop and reconcile with the user before proceeding.
+
+**Note on dependency wheels.** The plan pins `requires-python = "==3.14.*"` (Python 3.14 was released Oct 2025; this plan targets 2026-05+). If `uv sync` fails because a transitive dep lacks 3.14 wheels, bump that dep's minimum to the next available release in `pyproject.toml` and re-sync. Do not silently downgrade `requires-python`.
+
+**Note on `make run-gui` / `make run-cli`.** These targets are wired up in Task 1.3 but the entry points they invoke (`henrietta_guider.gui.app:main`, `henrietta_guider.cli.__main__:main`) don't exist until Chunks 6 and 5 respectively. `uv sync` may emit a warning about the missing modules; that's expected and harmless. The targets only fail if you actually run them before those chunks land.
 
 ---
 
@@ -259,10 +287,20 @@ def test_package_imports():
 Run: `uv run pytest -v`
 Expected: 1 test passes.
 
-- [ ] **Step 5: Run ruff.**
+- [ ] **Step 5: Format new files, then verify.**
 
-Run: `uv run ruff check . && uv run ruff format --check .`
-Expected: clean exit (no findings).
+`ruff format --check` is strict about empty-file trailing newlines and
+similar nits, so run the formatter first to bring everything in line:
+
+```bash
+uv run ruff format .
+uv run ruff check . --fix
+uv run ruff format --check .
+uv run ruff check .
+```
+
+Expected: format and check pass cleanly. If `--fix` made any changes, the
+subsequent `--check` calls confirm they stuck.
 
 - [ ] **Step 6: Commit.**
 
@@ -397,7 +435,12 @@ Open https://github.com/nickkonidaris/Henrietta-Guider/actions and wait for the 
 
 - [ ] **Step 1: Write a 30-line README.**
 
-```markdown
+Note: the README contains a fenced shell block. The plan shows the
+README content with **tilde (~~~) outer fences** to avoid premature
+closure. When you write the file, the tildes are not part of the
+content — only the inner triple-backtick fence goes into `README.md`.
+
+~~~markdown
 # Henrietta-Guider
 
 Autoguider for the Henrietta IR spectrograph on the Swope telescope at Las
@@ -420,7 +463,7 @@ make test                # run the test suite
 - **Open questions**: `Questions-for-William.md`
 - **Implementation plan**: `docs/superpowers/plans/2026-05-01-henrietta-autoguider.md`
 - **GUI mockups**: `mockups/gui_mockup.png` and `mockups/estimate_k_mockup.png`
-```
+~~~
 
 - [ ] **Step 2: Commit.**
 
