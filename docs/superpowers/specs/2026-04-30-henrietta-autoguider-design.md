@@ -242,29 +242,50 @@ does not falsely trip the alert).
 ### Target-switch detection
 
 Even if frames keep arriving, the operator may swap targets without
-stopping the guider. Two signals are checked on every accepted frame:
+stopping the guider. Two signals are checked on every accepted frame,
+with **different severities**:
 
-- **Pointing jump.** Read RA, Dec from the FITS header. Compare to the
-  previous accepted frame's values. If
-  `√((ΔRA · cos(Dec))² + ΔDec²) > quality.target_switch_arcsec_threshold`
-  (default 20″), flag a probable target switch.
-- **Object name change.** Read the `OBJECT` keyword (exact keyword TBC
-  with William). If it differs from the previous frame's, flag a probable
-  target switch.
+#### Pointing jump (authoritative)
 
-On flag, regardless of which signal triggered:
+Read RA, Dec from the FITS header. Compute the on-sky distance from the
+previous accepted frame:
 
-- An `ERROR`-level alert is raised: "Target change possible — pointing
-  jumped %.1f″" or "Target change possible — OBJECT %s → %s."
-- The audio alert plays the **spoken warning** "target change possible"
-  in addition to the normal warning sound (see §9).
-- The state machine transitions to `REFERENCE_PENDING` (same as the
-  stale-frame stop above), discarding the reference image and resetting
-  running statistics.
+```
+d = √((ΔRA · cos(Dec))² + ΔDec²)
+```
+
+If `d > quality.target_switch_arcsec_threshold` (default 20″), this is a
+serious indication of a real target swap. **Full alert**:
+
+- An `ERROR`-level banner: "Target change possible — pointing jumped %.1f″"
+- The warning sound + the spoken phrase "target change possible" (§9).
+- State machine transitions to `REFERENCE_PENDING`, discarding the
+  reference image and resetting out-of-family running statistics.
+
+#### OBJECT keyword change (advisory)
+
+Read the `OBJECT` keyword (exact keyword TBC with William). If it differs
+from the previous frame's value, this *might* be a target switch — but it
+might also just be the operator updating a metadata label without
+actually slewing. So this is treated as a **soft warning**:
+
+- A `WARN`-level (yellow) banner: "OBJECT changed: %s → %s — verify"
+- A brief beep (Tk's `widget.bell()` — the system tink, not the louder
+  warning sound). No spoken phrase.
+- A log line at `WARNING`.
+- **Guiding continues**; no state transition.
+
+The pointing-jump check is independent and will catch a real swap on its
+own. The OBJECT check is just informational — useful when the operator
+updates the target label *and* slews (you get both alerts), or updates
+just the label (you get only the small beep, and guiding rolls on).
+
+If both checks trip on the same frame, the pointing-jump path wins
+(full alert; the small beep is suppressed).
 
 The first frame after a fresh `Save Reference` is treated as the new
 "previous" — no comparison is made, so the very first frame on a new
-target never trips this check.
+target never trips either check.
 
 ### SUTR difference model
 
@@ -817,12 +838,16 @@ sound:
 - **stale-frame timeout** (no new SUTRs within
   `quality.stale_frame_timeout_s`) — guiding has stopped because the
   Archon is no longer producing frames.
-- **target switch** — pointing or `OBJECT` jumped (see §4 "Target-switch
-  detection"). In addition to the warning sound, a **spoken phrase**
-  ("target change possible") is played via the OS speech synthesiser
-  (`say` on macOS, `espeak` or equivalent on Linux). Spoken alerts can
-  be disabled with `display.audio_speak_alerts = false` (default `true`)
-  while still keeping the warning sound.
+- **target switch — pointing jump** (>20″ on-sky from previous frame).
+  Full alert: warning sound + **spoken phrase** ("target change
+  possible") via the OS speech synthesiser (`say` on macOS, `espeak` or
+  equivalent on Linux). Spoken alerts can be disabled with
+  `display.audio_speak_alerts = false` (default `true`) while still
+  keeping the warning sound.
+- **target switch — OBJECT-keyword-only change** (no pointing jump).
+  Soft signal: just a brief system beep (Tk `widget.bell()`), no spoken
+  phrase, no warning sound, no state change. See §4 "Target-switch
+  detection."
 - **TCS disconnect** — guiding can't proceed because commands are not
   reaching the telescope.
 - **ridge auto-fit failure on a Save Reference attempt** — a calibration
