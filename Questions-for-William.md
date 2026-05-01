@@ -10,7 +10,9 @@ Last updated: 2026-04-30
 
 1. **Settle time between successive `G` commands.** What is the minimum interval
    we should respect between sending two `G` offsets so that the second one is
-   not silently dropped by the `!guiding_ra && !guiding_dec` gate?
+   not silently dropped by the `!guiding_ra && !guiding_dec` gate? This also
+   sets the max effective rate at which we can split a large correction into
+   multiple `G` commands.
 2. **`guider_cmd_processing` flag.** What controls this — operator UI on the
    TCS, a separate command from the instrument computer, or some internal
    state? How do we know it's enabled before we start guiding?
