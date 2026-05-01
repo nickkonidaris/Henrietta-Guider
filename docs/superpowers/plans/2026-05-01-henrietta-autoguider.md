@@ -714,7 +714,7 @@ def decode_command(frame: bytes) -> tuple[float, float]:
 - [ ] **Step 4: Run the tests, confirm they pass.**
 
 Run: `uv run pytest tests/unit/test_wire.py -v`
-Expected: all green. The round-trip property test is the slowest (~5k pairs); should still finish in well under 10 seconds.
+Expected: all green. The round-trip property test is the slowest (~246 k pairs at 0.01" spacing); should finish in a few seconds.
 
 - [ ] **Step 5: Lint.**
 
@@ -1054,6 +1054,16 @@ class TestDetectorToSky:
         _, dec_n = detector_to_sky(0.0, 1.0, self.PLATE, 0.0, +1, -1)
         assert dec_n == pytest.approx(-dec_p)
 
+    def test_pa_45_diagonal(self):
+        # PA=45 with dx=1, dy=0: drift = (cos45, -sin45) * PLATE,
+        # correction = -drift = (-cos45, +sin45) * PLATE.
+        # Pin the rotation direction explicitly so a future formula
+        # tweak that swaps cos/sin gets caught.
+        ra, dec = detector_to_sky(1.0, 0.0, self.PLATE, 45.0, +1, +1)
+        s = math.sqrt(0.5)
+        assert ra  == pytest.approx(-self.PLATE * s)
+        assert dec == pytest.approx(+self.PLATE * s)
+
     def test_full_pa_sweep_preserves_magnitude(self):
         # The total (RA, Dec) magnitude must equal sqrt(dx^2 + dy^2) * plate
         # for any PA / parity combo (a rotation+sign-flip preserves L2).
@@ -1124,13 +1134,12 @@ def detector_to_sky(
     dy_arcsec = parity_y * dy_px * plate_scale_arcsec_per_px
     pa = math.radians(pa_deg)
     cos_pa, sin_pa = math.cos(pa), math.sin(pa)
-    # Standard rotation: drift_RA  = +dx*cos - dy*sin (no, see below)
-    # We use the convention that detector +Y is north of east by PA, so
-    # the drift in (RA, Dec) from a detector pixel offset (dx, dy) is:
+    # Convention: detector +Y is east of north by PA, so the drift in
+    # (RA, Dec) from a detector pixel offset (dx, dy) is:
     #     drift_RA  = dx*cos_pa + dy*sin_pa
     #     drift_Dec = dy*cos_pa - dx*sin_pa
     # Correction = -drift; both components flipped together so the
-    # transform stays magnitude-preserving (it's a rotation × -1).
+    # transform stays magnitude-preserving (rotation × -1).
     dra  = -(dx_arcsec * cos_pa + dy_arcsec * sin_pa)
     ddec = -(dy_arcsec * cos_pa - dx_arcsec * sin_pa)
     return dra, ddec
