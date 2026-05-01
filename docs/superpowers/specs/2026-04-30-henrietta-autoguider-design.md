@@ -175,10 +175,20 @@ settle-timer is the cross-platform path for v1.
 The real filename pattern (per the sample frames in `test/`) is
 `henNNNN_sssr.fits` for the per-SUTR raw reads (e.g. `hen1764_017r.fits`),
 plus a final integrated `henNNNN.fits` per integration. The watcher
-matches `^hen(\d{4})_(\d{3})r\.fits$` and ignores any other filename
-pattern (the bare `henNNNN.fits` carries no new SUTR information beyond
-what `_023r` already gave us, so it is logged at DEBUG and dropped). The
-parsed `(NNNN, sss)` are pushed into the inbound queue.
+recognises **both** patterns and routes them differently:
+
+- `^hen(\d{4})_(\d{3})r\.fits$` → parsed as `(frame_number, sutr_number)`
+  and pushed onto the **SUTR queue**, where the K-window difference
+  pipeline picks them up (§"SUTR difference model" / §"Per-frame
+  measurement").
+- `^hen(\d{4})\.fits$` → parsed as `frame_number` and pushed onto the
+  **slope-frame queue**, where the template-build pipeline picks it up
+  (§"Template build"). This is the **only** path that updates the
+  template — per-SUTR files never feed the template, no matter how many
+  arrive.
+
+Any other filename in the watch directory is logged at `DEBUG` and
+dropped.
 
 ### Sequential-order sanity checks
 
