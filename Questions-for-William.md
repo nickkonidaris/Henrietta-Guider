@@ -34,11 +34,31 @@ Last updated: 2026-04-30
    real convention).
 7. **Output directory.** Where does the DAQ write completed SUTR frames?
    Configurable, or fixed?
-8. **Filename convention.** What does the filename look like (UTC stamp,
-   sequence number, target, …)? Any sidecar files (e.g. `.hdr`, `.log`)?
-9. **FITS structure.** Is the file already a 2D collapsed image (slope fit
-   from the SUTR ramp), or a SUTR cube we have to reduce ourselves? Single
-   extension or MEF? Pixel datatype?
+8. **Filename convention.** Real-data sample shows
+   `henNNNN_sssr.fits` (e.g. `hen1764_001r.fits`) for the per-SUTR raw
+   reads, plus a final integrated `henNNNN.fits` (no underscore, no `r`)
+   per integration. Need to confirm:
+   - What does the trailing `r` mean? Candidates: (a) "raw" read, (b)
+     "reference-pixel-corrected" already, (c) just a naming convention.
+   - Is `_sssr` the only suffix, or are there processed variants (e.g.
+     `_sssp`, `_sssc`) that may also land in the watch directory?
+   - The final `henNNNN.fits` (no `_sss`): is that the ramp's slope-fit
+     output, an end-of-integration co-add, or something else? Should the
+     autoguider react to it (it carries no new SUTR information once the
+     `_023r` has arrived) or ignore it?
+   - Any sidecar files (`.hdr`, `.log`, `.thumb.png`)?
+9. **FITS structure.** Real-data sample is a 2048×2048 single-extension
+   image, `BITPIX=16`, `BUNIT='DU/PIXEL'`, `BSCALE=1.0`, `BZERO=0.0`. So
+   each `_sssr.fits` IS a 2D image (one read at sample `sss`), as
+   expected — not a SUTR cube. Need to confirm:
+   - Are the outer 4 rows/columns reference pixels (standard H2RG layout)?
+     If so, the autoguider should mask them before any reduction.
+   - Pixel datatype is `int16` after BSCALE/BZERO — does that match all
+     possible read modes, or do high-flux reads ever overflow into a
+     signed-int wrap? (`saturation_dn = 40000` config default suggests
+     headroom is fine, but worth confirming.)
+   - Single extension vs MEF: confirm always single, or is there ever a
+     case (e.g. dark-corrected runs) with extra HDUs?
 10. **Pointing in the FITS header.** Are HA, Dec, RA, Dec, rotator angle (PA),
     UTC, exposure time, airmass, **detector temperature**, and **focus
     position** all already written to the FITS header by the DAQ? Exact
