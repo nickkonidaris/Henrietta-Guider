@@ -40,9 +40,10 @@ Last updated: 2026-04-30
    from the SUTR ramp), or a SUTR cube we have to reduce ourselves? Single
    extension or MEF? Pixel datatype?
 10. **Pointing in the FITS header.** Are HA, Dec, RA, Dec, rotator angle (PA),
-    UTC, exposure time, and any TCS state already written to the FITS header
-    by the DAQ? (We need HA & Dec to bin the guiding measurements for
-    nonperiodic-error analysis.)
+    UTC, exposure time, airmass, **detector temperature**, and **focus
+    position** all already written to the FITS header by the DAQ? Exact
+    keyword names? (We need HA & Dec to bin the guiding measurements for
+    nonperiodic-error analysis, and the others for diagnostics.)
 11. **Intermediate non-destructive reads.** Confirmed not available — the
     only signal we get is one completed file per 1–3 min. (No action needed,
     just flagged.)
