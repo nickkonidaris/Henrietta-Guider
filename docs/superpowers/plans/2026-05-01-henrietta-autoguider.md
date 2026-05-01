@@ -27,11 +27,14 @@ Before starting any task, verify the working environment:
   - If older, install/upgrade via `curl -LsSf https://astral.sh/uv/install.sh | sh`, then `exec $SHELL` and retry.
 
 - [ ] **The Python build is the GIL build (not free-threaded).**
-  - After Task 1.1 finishes (or right now if the venv exists), run:
-    `uv run python -c "import sys; assert not sys._is_gil_enabled() is False, 'free-threaded build detected'"`
-    Actually a cleaner check: `uv run python -c "import sys; print('free-threaded' if hasattr(sys, '_is_gil_enabled') and not sys._is_gil_enabled() else 'GIL'); import sysconfig; print(sysconfig.get_config_var('Py_GIL_DISABLED'))"`
-    Expected: `GIL` and `0` (or `None`). The free-threaded build prints `free-threaded` and `1`.
-  - If free-threaded: re-pin in `.python-version` to `3.14.X` (a specific patch known to be the regular build) or run `uv python install --no-bundled 3.14` and pick the GIL variant explicitly.
+  - After Task 1.1 finishes (or right now if the venv already exists), run:
+
+    ```bash
+    uv run python -c "import sysconfig; assert not sysconfig.get_config_var('Py_GIL_DISABLED'), 'free-threaded build detected'"
+    ```
+
+    Expected: exits 0 silently. If `AssertionError` fires, the venv is using the free-threaded build.
+  - **Recovery if free-threaded was selected:** pin a specific patch known to be the regular GIL build in `.python-version` (e.g. `3.14.3` rather than `3.14`), delete `.venv/`, and run `uv sync` again. uv's default downloads the GIL variant for any `3.14.x` patch number; the free-threaded variant is only used when explicitly requested with the `+freethreaded` suffix.
 
 - [ ] **Spec, algorithm, wire format, and questions doc are committed:**
   - `docs/superpowers/specs/2026-04-30-henrietta-autoguider-design.md`
