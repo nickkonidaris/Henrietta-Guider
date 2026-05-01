@@ -92,18 +92,25 @@ def synth_timeseries(n: int = 240, rng: np.random.Generator | None = None):
     return t, dx, dy, fwhm, flux, flux_cmp, sky, xcor
 
 
-def synth_snr_per_pixel(rng: np.random.Generator | None = None,
-                        gain_e_per_dn: float = 4.0) -> np.ndarray:
-    """Synthetic per-pixel SNR distribution for the science stamp:
-    a low-SNR sky pedestal plus a high-SNR trace ridge."""
+def synth_signal_snr(t: np.ndarray,
+                     rng: np.random.Generator | None = None) -> np.ndarray:
+    """Synthetic per-stamp signal_snr time series.
+
+    Rises through each integration as more reads accumulate, then resets
+    sharply at each frame-number boundary. Roughly 23 SUTRs per
+    integration at the default 1.3 s cadence.
+    """
     if rng is None:
         rng = np.random.default_rng(11)
-    # ~70k pixels in the stamp. Most are sky-dominated (low signal),
-    # a few thousand sit on the trace (high signal).
-    sky_DN   = np.clip(rng.normal(60, 12, 60000), 1, None)
-    trace_DN = np.clip(rng.normal(2400, 800, 8000), 1, None)
-    all_DN   = np.concatenate([sky_DN, trace_DN])
-    return np.sqrt(all_DN * gain_e_per_dn)
+    # frame boundary every ~30s (23 SUTRs × 1.3 s). t is in minutes.
+    integration_s = 30.0 / 60.0  # 0.5 min per integration
+    phase = (t % integration_s) / integration_s   # 0 -> 1 within an integration
+    # SNR growth ~ sqrt(t) within an integration; saturates at end.
+    snr = 220.0 * np.sqrt(phase + 0.05) + rng.normal(0, 4, t.size)
+    # Clouds: knock down SNR during the alert region.
+    cloud_mask = (t > t[150]) & (t < t[174])
+    snr[cloud_mask] *= 0.45
+    return snr
 
 
 # ---------------------------------------------------------------------------
@@ -113,19 +120,18 @@ def synth_snr_per_pixel(rng: np.random.Generator | None = None,
 def render():
     img = synth_image()
     t, dx, dy, fwhm, flux, flux_cmp, sky, xcor = synth_timeseries()
-    snr = synth_snr_per_pixel()
+    signal_snr = synth_signal_snr(t)
 
-    fig = plt.figure(figsize=(15.5, 14.5), facecolor="#ECECEC")
+    fig = plt.figure(figsize=(15.5, 12.5), facecolor="#ECECEC")
     gs = GridSpec(
         nrows=10,
         ncols=2,
         height_ratios=[0.6, 4.5, 4.5, 0.5,
-                       0.85, 0.85, 0.85, 0.85, 0.85,  # 5 time-series rows
-                       2.20],                           # SNR histogram (taller)
+                       0.85, 0.85, 0.85, 0.85, 0.85, 0.85],  # 6 time-series rows
         width_ratios=[3.4, 2.2],
         hspace=0.50,
         wspace=0.10,
-        left=0.045, right=0.985, top=0.965, bottom=0.055,
+        left=0.045, right=0.985, top=0.965, bottom=0.045,
     )
 
     # ---- status bar (top) ---------------------------------------------------
@@ -322,6 +328,7 @@ def render():
                                       (t, flux_cmp, "comparison", "#9467bd")]),
         ("sky bg (ADU)",             [(t, sky, None, "#7f7f7f")]),
         ("xcor peak",                [(t, xcor, None, "#e377c2")]),
+        (r"signal SNR  $\sqrt{e^-}$", [(t, signal_snr, None, "#ff7f0e")]),
     ]
 
     for i, (ylabel, traces) in enumerate(series):
@@ -346,54 +353,6 @@ def render():
             ax.set_xlabel("time (min)", fontsize=8.5)
         else:
             ax.set_xticklabels([])
-
-    # ---- per-pixel SNR histogram (last row, full width) --------------------
-    ax_hist = fig.add_subplot(gs[9, :])
-    ax_hist.set_facecolor("#FFFFFF")
-    for s in ax_hist.spines.values():
-        s.set_edgecolor("#999"); s.set_linewidth(0.5)
-
-    bins = np.linspace(0, snr.max() * 1.05, 80)
-    counts, edges, _ = ax_hist.hist(
-        snr, bins=bins, color="#4c78a8", edgecolor="#274860",
-        linewidth=0.4,
-    )
-
-    # Gaussian reference overlay: μ = median SNR, σ = MAD-based scale
-    mu_typ    = float(np.median(snr))
-    mad       = float(np.median(np.abs(snr - mu_typ)))
-    sigma_n   = mad * 1.4826 if mad > 0 else float(np.std(snr))
-    bin_w     = edges[1] - edges[0]
-    x_g       = np.linspace(edges[0], edges[-1], 600)
-    # Scale the Gaussian to peak at the same height as a Gaussian with this
-    # σ would, given the total counts (so it visually "matches" the data
-    # density rather than the histogram peak).
-    g_density = (1.0 / (sigma_n * np.sqrt(2 * np.pi))) * np.exp(
-        -0.5 * ((x_g - mu_typ) / sigma_n) ** 2
-    )
-    g_scaled  = g_density * snr.size * bin_w
-    ax_hist.plot(x_g, g_scaled, color="#E63946", lw=1.6,
-                 label=fr"reference $\mathcal{{N}}(\mu={mu_typ:.1f},\,\sigma={sigma_n:.1f})$")
-
-    ax_hist.axvline(1.0,  color="#888", lw=0.7, ls=":")
-    ax_hist.axvline(5.0,  color="#888", lw=0.7, ls=":")
-    ax_hist.text(1.0,  ax_hist.get_ylim()[1] * 0.92, " SNR=1",
-                 color="#666", fontsize=7.5, va="top")
-    ax_hist.text(5.0,  ax_hist.get_ylim()[1] * 0.92, " SNR=5",
-                 color="#666", fontsize=7.5, va="top")
-    ax_hist.set_xlabel(
-        r"per-pixel SNR  =  $\sqrt{\mathrm{signal\_DN}\,\cdot\,\mathrm{gain}}$",
-        fontsize=8.5,
-    )
-    ax_hist.set_ylabel("pixels", fontsize=8.5)
-    p10 = float(np.percentile(snr, 10))
-    ax_hist.set_title(
-        f"Per-pixel SNR histogram — current frame, science stamp "
-        f"(median {mu_typ:.1f},  10th-percentile {p10:.1f})",
-        fontsize=9, loc="left", color="#222", pad=4,
-    )
-    ax_hist.legend(loc="upper right", fontsize=8, framealpha=0.85)
-    ax_hist.tick_params(labelsize=7.5)
 
     fig.suptitle(
         "Henrietta autoguider — operator GUI mockup (synthetic data)",

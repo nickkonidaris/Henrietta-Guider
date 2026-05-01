@@ -500,31 +500,29 @@ Per-frame quantities recorded for analysis:
 - `sky_background_adu` — median of per-row sky pedestals.
 - `template_frame_number` — which `henNNNN.fits` produced the active
   template, for retrospective traceability.
-- **Per-pixel shot-noise-limited SNR.** Using the cumulative signal in
-  the current frame (i.e., `current_read − reset_read`, not the K-window
-  diff) without sky subtraction:
+- **Per-stamp aggregate SNR.** Computed once per **SUTR** (every new
+  `henNNNN_sssr.fits`, not just on K-window guide images) using the
+  cumulative signal since reset, without sky subtraction:
 
   ```
-  signal_DN     = current_read − reset_read     # per pixel, full frame so far
-  SNR_per_px    = sqrt(signal_DN × gain_e_per_DN)
+  signal_DN(x, y)  = current_read(x, y) − reset_read(x, y)
+  total_e          = Σ_unmasked  signal_DN(x, y) · gain_e_per_DN
+                                   (over the stamp; BPM applied)
+  signal_snr       = sqrt(max(total_e, 0))
   ```
 
-  This is the per-pixel SNR you'd have under shot-noise-only assumption.
-  It's a snapshot per guide image; the stamp's distribution is shown as
-  a live histogram in the GUI (§9). Two summary stats land in
-  `stamp_measurements` for retrospective trend analysis:
-  `signal_snr_median` and `signal_snr_p10` (10th-percentile across
-  unmasked stamp pixels).
+  This is the shot-noise-limited SNR you'd have on the integrated stamp
+  flux. It rises through each integration (more reads accumulated) and
+  resets toward zero at every frame-number boundary (new detector
+  reset). One scalar per stamp per SUTR; stored in `stamp_measurements`
+  as `signal_snr` and plotted as its own row in the GUI time-series
+  stack.
 
-  **Edge cases.** If the stamp has zero unmasked pixels (e.g., the BPM
-  swallowed everything in a misconfigured stamp), or if any pixel has
-  `signal_DN ≤ 0` (it's clipped to 0 before the sqrt), or if the MAD
-  used for the histogram's Gaussian overlay is zero (degenerate
-  one-value distribution), the autoguider:
-  - writes `NULL` for `signal_snr_median` and `signal_snr_p10` in
-    `stamp_measurements`;
-  - shows the histogram panel as empty with a centred "no data" label;
-  - logs a `WARNING` once (not per-frame).
+  **Edge cases.** If the stamp has zero unmasked pixels or `total_e ≤ 0`
+  (sub-reset reads on a freshly-reset frame), the autoguider writes
+  `NULL` for `signal_snr` in `stamp_measurements` and the time-series
+  plot shows a gap. A `WARNING` is logged once per occurrence (not per
+  frame).
 
 `(dx_px, dy_px)` are converted to sky offsets (§6).
 
@@ -734,8 +732,7 @@ CREATE TABLE stamp_measurements (
     trace_fwhm_x_px       REAL,
     trace_flux_adu        REAL,
     sky_background_adu    REAL,
-    signal_snr_median     REAL,               -- median sqrt(DN·gain) over unmasked stamp pixels
-    signal_snr_p10        REAL,               -- 10th-percentile of the same
+    signal_snr            REAL,               -- sqrt(Σ unmasked signal_DN · gain) over the stamp
     quality_flags         TEXT,               -- JSON
     PRIMARY KEY (frame_number, sutr_number, stamp_id),
     FOREIGN KEY (frame_number, sutr_number)
@@ -853,15 +850,10 @@ Single Tk window, layout:
 │     trace_flux_adu       — science (solid), comparison (dashed)      │
 │     sky_background_adu                                               │
 │     xcor_peak_value      — drops on cloud / template mismatch        │
+│     signal_snr           — per-stamp √(Σ DN·gain), one point per     │
+│                            SUTR; rises through each integration and  │
+│                            resets at each new frame_number boundary  │
 │     commands sent (RA, Dec)                                          │
-├──────────────────────────────────────────────────────────────────────┤
-│   Per-pixel SNR histogram (current frame, science stamp):            │
-│     X = √(signal_DN · gain),  Y = pixel count                        │
-│     vertical guides at SNR = 1, 5                                    │
-│     Gaussian reference overlay: mean μ = median SNR (typical signal),│
-│       σ = MAD-derived spread (~ noise scale). Lets the operator see  │
-│       at a glance how Gaussian-like the bulk of the distribution is. │
-│     Redraws on every guide image.                                    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
