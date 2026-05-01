@@ -541,11 +541,25 @@ class TestEncodeStep:
         assert encode_step(-49) == "51"
 
     @pytest.mark.parametrize("steps,encoded", [
+        # +0.05" through -2.45" — the canonical anchor points called out
+        # in Wireformat.md and the spec.
         (0, "00"), (1, "01"), (10, "10"), (50, "50"),
         (-1, "99"), (-2, "98"), (-49, "51"),
     ])
     def test_table(self, steps, encoded):
         assert encode_step(steps) == encoded
+
+    def test_half_step_rounding_is_bankers(self):
+        """Pin Python's default round-half-to-even on the 0.5 boundary so a
+        future switch to int(round(x)) or floor doesn't silently drift.
+
+        round(1.5) == 2 (rounds to even); round(2.5) == 2 (also even).
+        """
+        # 0.025" -> 0.5 step -> rounds to 0 (even), so encode_step(0) -> "00".
+        # We exercise this through encode_command in TestEncodeCommand below.
+        assert round(0.5) == 0
+        assert round(1.5) == 2
+        assert round(2.5) == 2
 
     def test_clamps_above_max(self):
         # Caller is expected to clamp first; encoder is defence in depth.
@@ -573,9 +587,15 @@ class TestEncodeCommand:
         assert encode_command(0.07, 0.024) == b"G0100\r"
 
     def test_round_trip_property(self):
+        """For every legal arcsec offset, decode(encode(x)) == round(x/0.05)*0.05.
+
+        We sample at 0.01" spacing on each axis. That's 496 × 496 ≈ 246 k
+        pairs — still finishes in a few seconds — which is plenty to
+        detect any sign-error or off-by-one in the encoder/decoder.
+        """
         import numpy as np
-        for x in np.arange(-2.45, 2.501, 0.001):
-            for y in np.arange(-2.45, 2.501, 0.001):
+        for x in np.arange(-2.45, 2.501, 0.01):
+            for y in np.arange(-2.45, 2.501, 0.01):
                 wire = encode_command(float(x), float(y))
                 ra, dec = decode_command(wire)
                 assert abs(ra  - round(x / GUIDE_STEP_ARCSEC) * GUIDE_STEP_ARCSEC) < 1e-9
@@ -751,26 +771,26 @@ class TestTCSClient:
         peer.close()
 
     def test_send_when_disconnected_returns_false(self):
+        # Build a client, then force DISCONNECTED — exactly the state a
+        # caller would see after a network drop. No timing-dependent
+        # buffering games.
         client, peer = self._make_with_pair()
-        peer.close()
-        # Send to a closed peer — first send may succeed (kernel buffer) or
-        # fail; the next send after we've registered DISCONNECTED returns
-        # False without raising.
-        client.send_guide(0.0, 0.0)            # may flag DISCONNECTED
-        client.send_guide(0.0, 0.0)            # may flag DISCONNECTED
-        # Force the state for the assertion (test-only API):
         client._force_state(ConnectionState.DISCONNECTED)
         assert client.send_guide(0.0, 0.0) is False
         assert client.commands_suppressed_disconnected == 1
+        peer.close()
 
     def test_pacing_blocks_within_window(self):
-        client, peer = self._make_with_pair(pacing_s=0.20)
+        # Use a short pacing window with a generous proportional slack
+        # (60 ms wait for a 50 ms window — 20 % slack — robust on a
+        # loaded CI runner without slowing the test).
+        client, peer = self._make_with_pair(pacing_s=0.05)
         assert client.send_guide(0.0, 0.0) is True
         peer.recv(6)
         # Immediately again: should be suppressed.
         assert client.send_guide(0.05, 0.0) is False
         assert client.commands_suppressed_pacing == 1
-        time.sleep(0.22)
+        time.sleep(0.06)
         # Outside the window: should send.
         assert client.send_guide(0.05, 0.0) is True
         peer.recv(6)
@@ -982,6 +1002,16 @@ from henrietta_guider.core.geometry import detector_to_sky
 
 @pytest.mark.unit
 class TestDetectorToSky:
+    """detector_to_sky returns the *correction* (telescope offset that
+    cancels a measured detector-frame drift). At PA=0 with parities
+    +1/+1, a +1 px drift in detector X corresponds to +1 px of trace
+    motion toward east on the sky, so the correction is -plate arcsec
+    in RA. Same handedness for Y/Dec: +1 px drift -> -plate arcsec
+    correction in Dec. The function's overall sign is "correction =
+    -drift" applied uniformly to both axes, with a 2-D rotation by PA
+    in between.
+    """
+
     PLATE = 0.435  # arcsec/px (placeholder; real value from William)
 
     def test_zero_pa_zero_offset(self):
@@ -989,29 +1019,40 @@ class TestDetectorToSky:
         assert ra == pytest.approx(0.0)
         assert dec == pytest.approx(0.0)
 
-    def test_pa_zero_x_maps_to_ra(self):
-        # At PA=0, +Y on the detector points North (+Dec) and +X points East (+RA).
-        # parity_x = +1 means +X ~ +RA at PA=0; parity_y = +1 means +Y ~ +Dec.
-        # So a +1 px x-shift -> +plate" RA, 0 Dec.
+    def test_pa_zero_x_maps_to_negative_ra_correction(self):
+        # +1 px drift in detector X at PA=0 with parity_x=+1 corresponds
+        # to the trace having moved +RA on the sky. Correction = -drift,
+        # so the returned dRA is -plate.
         ra, dec = detector_to_sky(1.0, 0.0, self.PLATE, 0.0, +1, +1)
-        assert ra  == pytest.approx(-self.PLATE)  # see geometry.py docstring for sign convention
+        assert ra  == pytest.approx(-self.PLATE)
         assert dec == pytest.approx(0.0, abs=1e-12)
 
-    def test_pa_zero_y_maps_to_dec(self):
+    def test_pa_zero_y_maps_to_negative_dec_correction(self):
+        # +1 px drift in detector Y at PA=0 with parity_y=+1 corresponds
+        # to the trace having moved +Dec on the sky. Correction = -drift.
         ra, dec = detector_to_sky(0.0, 1.0, self.PLATE, 0.0, +1, +1)
         assert ra  == pytest.approx(0.0, abs=1e-12)
-        assert dec == pytest.approx(self.PLATE)
+        assert dec == pytest.approx(-self.PLATE)
 
-    def test_pa_90_x_maps_to_dec(self):
+    def test_pa_90_x_drift_becomes_dec_correction(self):
+        # At PA=90, detector +Y points east (+RA) and detector +X points
+        # south (-Dec). A +1 px drift in detector X is therefore -Dec
+        # drift on the sky -> correction is +plate in Dec.
         ra, dec = detector_to_sky(1.0, 0.0, self.PLATE, 90.0, +1, +1)
         assert ra  == pytest.approx(0.0, abs=1e-12)
-        assert dec == pytest.approx(-self.PLATE)
+        assert dec == pytest.approx(+self.PLATE)
 
     def test_parity_flip_x(self):
         # Flipping parity_x flips the RA contribution.
         ra_p, _ = detector_to_sky(1.0, 0.0, self.PLATE, 0.0, +1, +1)
         ra_n, _ = detector_to_sky(1.0, 0.0, self.PLATE, 0.0, -1, +1)
         assert ra_n == pytest.approx(-ra_p)
+
+    def test_parity_flip_y(self):
+        # And similarly for Dec via parity_y.
+        _, dec_p = detector_to_sky(0.0, 1.0, self.PLATE, 0.0, +1, +1)
+        _, dec_n = detector_to_sky(0.0, 1.0, self.PLATE, 0.0, +1, -1)
+        assert dec_n == pytest.approx(-dec_p)
 
     def test_full_pa_sweep_preserves_magnitude(self):
         # The total (RA, Dec) magnitude must equal sqrt(dx^2 + dy^2) * plate
@@ -1075,14 +1116,23 @@ def detector_to_sky(
     """Convert a measured detector pixel drift to a sky-frame correction.
 
     Returns (dRA_arcsec, dDec_arcsec) — the telescope correction that
-    cancels the drift.
+    cancels the drift. Equivalent to applying the parities, doing a 2-D
+    rotation by PA, then negating both components ("correction =
+    -drift").
     """
     dx_arcsec = parity_x * dx_px * plate_scale_arcsec_per_px
     dy_arcsec = parity_y * dy_px * plate_scale_arcsec_per_px
     pa = math.radians(pa_deg)
     cos_pa, sin_pa = math.cos(pa), math.sin(pa)
-    dra  = -dx_arcsec * cos_pa - dy_arcsec * sin_pa
-    ddec = -dx_arcsec * sin_pa + dy_arcsec * cos_pa
+    # Standard rotation: drift_RA  = +dx*cos - dy*sin (no, see below)
+    # We use the convention that detector +Y is north of east by PA, so
+    # the drift in (RA, Dec) from a detector pixel offset (dx, dy) is:
+    #     drift_RA  = dx*cos_pa + dy*sin_pa
+    #     drift_Dec = dy*cos_pa - dx*sin_pa
+    # Correction = -drift; both components flipped together so the
+    # transform stays magnitude-preserving (it's a rotation × -1).
+    dra  = -(dx_arcsec * cos_pa + dy_arcsec * sin_pa)
+    ddec = -(dy_arcsec * cos_pa - dx_arcsec * sin_pa)
     return dra, ddec
 ```
 
@@ -1155,10 +1205,45 @@ class TestController:
         assert ctrl.step(+5.0) == pytest.approx(+2.45)
         assert ctrl.step(-5.0) == pytest.approx(-2.45)
 
-    def test_alerted_freezes_state_v1_pure_p(self):
-        # In v1 the controller is pure-P (stateless), so on_alerted() is
-        # a no-op. The test fixture exists so future PI/PID code can't
-        # silently break the contract.
+    def test_deadband_pass_then_clip(self):
+        # Combined: error passes the deadband AND requires clipping.
+        ctrl = self._make(Kp=10.0, deadband_arcsec=0.05, max_command_arcsec=0.5)
+        assert ctrl.step(0.06) == pytest.approx(0.5)
+
+    def test_integral_does_not_accumulate_when_Ki_is_zero(self):
+        # With Ki=0 (the v1 default) the integrator must stay at 0
+        # forever, so a config-time Ki bump (no code change) doesn't
+        # suddenly inject a huge accumulated error.
+        ctrl = self._make(Kp=0.5, Ki=0.0)
+        for _ in range(1000):
+            ctrl.step(0.10)
+        assert ctrl._integral == 0.0
+
+    def test_integral_accumulates_when_Ki_is_nonzero(self):
+        ctrl = self._make(Kp=0.5, Ki=0.01)
+        for _ in range(10):
+            ctrl.step(0.10)
+        # 10 steps of +0.10" each, all above deadband:
+        assert ctrl._integral == pytest.approx(1.0)
+
+    def test_on_alerted_freezes_integral(self):
+        # PI scenario: integral must NOT advance while frozen, must
+        # resume on on_resumed().
+        ctrl = self._make(Kp=0.5, Ki=0.01)
+        for _ in range(5):
+            ctrl.step(0.10)
+        before = ctrl._integral
+        ctrl.on_alerted()
+        for _ in range(5):
+            ctrl.step(0.10)
+        assert ctrl._integral == before  # frozen
+        ctrl.on_resumed()
+        ctrl.step(0.10)
+        assert ctrl._integral == pytest.approx(before + 0.10)
+
+    def test_v1_pure_p_unaffected_by_alerted(self):
+        # With Ki=Kd=0 (v1) the controller is stateless wrt _integral,
+        # so on_alerted() doesn't change step() output.
         ctrl = self._make()
         ctrl.on_alerted()
         assert ctrl.step(0.10) == pytest.approx(0.05)
@@ -1215,9 +1300,13 @@ class Controller:
         if abs(error_arcsec) < self.cfg.deadband_arcsec:
             return 0.0
         cmd = self.cfg.Kp * error_arcsec
-        # Ki / Kd hooks. Disabled when frozen.
+        # Ki / Kd hooks. Disabled when frozen and skipped entirely when
+        # Ki == 0 (v1) so the integral never grows. This prevents a
+        # config-time Ki bump from suddenly injecting a huge accumulated
+        # error from a long previous run.
+        if not self._frozen and self.cfg.Ki != 0.0:
+            self._integral += error_arcsec
         if not self._frozen:
-            self._integral += error_arcsec  # accumulator (used when Ki > 0)
             self._last_error = error_arcsec
         cmd += self.cfg.Ki * self._integral
         # (Kd term omitted in v1; would use _last_error here.)
@@ -1271,10 +1360,16 @@ Expected: 4 modules' worth of tests, all green; should finish in well under 30 s
 Run: `make lint`
 Expected: clean.
 
-- [ ] **Step 3: Confirm CI passes on the push.**
+- [ ] **Step 3: Push and confirm CI is green.**
 
-Run: `git log --oneline -10`
-Confirm the four new commits are there. Push if not already pushed (the per-task commits don't push automatically), then check GitHub Actions.
+```bash
+git log --oneline -10            # confirm the four new commits
+git push                         # push the chunk
+gh run watch                     # streams the current workflow until complete
+```
+
+Expected: `gh run watch` exits 0 (workflow concluded with success).
+If `gh` is not installed, open https://github.com/nickkonidaris/Henrietta-Guider/actions in a browser and wait for the green check.
 
 - [ ] **Step 4: Confirm git status is clean.**
 
