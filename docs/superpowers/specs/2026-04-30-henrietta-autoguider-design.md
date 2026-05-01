@@ -154,16 +154,21 @@ have to detect completion ourselves rather than rely on `on_moved` for an
 atomic rename.
 
 The watcher subscribes to both `on_created` and `on_modified` events for
-`.fits` paths. Whenever an event arrives for a file, we (re)set a 1.0-s
+`.fits` paths. Whenever an event arrives for a file, we (re)set a 0.2-s
 "settle timer" for that path; once the timer fires with no further events,
 we attempt to open the file with `astropy.io.fits` in update-strict mode.
 A successful open with `NAXIS1 × NAXIS2 × |BITPIX|/8` matching the data
 section size confirms the file is complete; otherwise the file is still
 being written and we wait for the next event.
 
-The 1.0-s settle is safe at the file-size level (8 MB writes in well under
-100 ms on modern disks) and well below the smallest SUTR sample interval
-of 1.3 s.
+The 0.2-s interval is empirically sufficient — `experiments/watchdog_close_event_test.py`
+shows that on macOS the kqueue and fsevents event streams stop arriving
+within milliseconds of the actual file-write completion. 0.2 s gives us
+~200 ms of margin while still being well below the smallest SUTR sample
+interval of 1.3 s. On Linux a future optimization can use the
+`on_closed` event directly (inotify exposes `IN_CLOSE_WRITE`); the macOS
+backends of `watchdog` do not implement close-event mapping, so the
+settle-timer is the cross-platform path for v1.
 
 The real filename pattern (per the sample frames in `test/`) is
 `henNNNN_sssr.fits` for the per-SUTR raw reads (e.g. `hen1764_017r.fits`),
@@ -172,6 +177,39 @@ matches `^hen(\d{4})_(\d{3})r\.fits$` and ignores any other filename
 pattern (the bare `henNNNN.fits` carries no new SUTR information beyond
 what `_023r` already gave us, so it is logged at DEBUG and dropped). The
 parsed `(NNNN, sss)` are pushed into the inbound queue.
+
+### Sequential-order sanity checks
+
+The Archon is expected to write SUTRs in monotonically increasing order
+within a frame, and frame numbers in monotonically increasing order
+across frames. The watcher enforces this and flags violations:
+
+- **Within a frame.** Track the highest `sutr_number` seen for the
+  current `frame_number`. On a new file:
+  - Expected case: `sutr == last_sutr + 1` (or `sutr == 1` on a new
+    frame). Process normally.
+  - **Skipped SUTR** (`sutr > last_sutr + 1`): log a `WARNING`
+    ("frame %d: SUTRs %d..%d missing"), discard the rolling-read buffer
+    contents that would have used the missing reads, and resume building
+    K-window differences from the new SUTR forward.
+  - **Out-of-order SUTR** (`sutr ≤ last_sutr`): log a `WARNING`
+    ("frame %d: out-of-order SUTR %d after %d"), discard the file, do
+    not update the buffer.
+- **Across frames.** Track the highest `frame_number` seen.
+  - Expected case: `frame_number > last_frame_number`. Process; clear the
+    rolling-read buffer (a new detector reset, see §4 "Frame boundary
+    handling").
+  - **Skipped frame numbers** (gap of >1): log `INFO`
+    ("frame %d → %d; %d frame(s) skipped"). This is a normal operational
+    occurrence (operator aborted exposures) — not an alert.
+  - **Backwards or repeated frame number** (`frame_number ≤ last`):
+    log a `WARNING`, discard the file. This indicates a serious Archon
+    or filesystem problem; it should never happen in normal operation.
+
+These checks are quiet sanity nets: they don't trip the audio alert or
+banner ALERT/ERROR levels in the GUI, but every violation lands in the
+logs and (for non-discarded frames) in `quality_flags` on the
+`box_measurements` row so retrospective analysis can spot patterns.
 
 ### Stale-frame watchdog
 

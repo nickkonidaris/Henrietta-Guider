@@ -76,6 +76,13 @@ Last updated: 2026-04-30
 11. **Intermediate non-destructive reads.** Confirmed not available — the
     only signal we get is one completed file per 1–3 min. (No action needed,
     just flagged.)
+12. **Sequential ordering guarantees.** Are SUTRs (`_001r`, `_002r`, …)
+    always written **in order**, with **no gaps**, and with each
+    `frame_number` strictly larger than the previous? The autoguider
+    treats violations as anomalies (out-of-order or repeated SUTR =
+    discard the file with a warning; skipped SUTRs = lose one K-window
+    diff and continue). If the Archon ever legitimately writes
+    out-of-order or skips numbers, we need to know.
 
 ## Instrument geometry
 
