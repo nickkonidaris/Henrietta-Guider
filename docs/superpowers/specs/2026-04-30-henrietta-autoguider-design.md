@@ -23,7 +23,7 @@ non-periodic mount errors.
 - Reading SUTR FITS frames as they appear on disk and computing per-frame
   trace measurements.
 - Closed-loop fine guiding (per-axis P controller, with hooks for PI/PID).
-- A Tk + ttk + matplotlib operator GUI for region selection, ridge-line setup,
+- A Tk + ttk + matplotlib operator GUI for stamp / template setup,
   live image + plot display, and alerts.
 - A SQLite archive of every measurement.
 - A "headless" CLI for batch / scripted runs.
@@ -97,8 +97,9 @@ henrietta_guider/
 ├── core/                      no UI imports anywhere in this subtree
 │   ├── watcher.py             watchdog + atomic-rename → image queue
 │   ├── reduce.py              SUTR FrameBuffer, masking, bg subtraction
-│   ├── centroid.py            ridge fit, dX from per-row centroids,
-│   │                          dY from cross-correlation, FWHM, flux
+│   ├── measure.py             stamp prep, local sky subtraction, BPM,
+│   │                          2-D xcor against template, sub-pixel peak,
+│   │                          FWHM, flux
 │   ├── controller.py          P (PI/PID hooks), dead band, max clip
 │   ├── tcs_client.py          TCP socket, G-command encoder, pacing
 │   ├── store.py               SQLite (frames + box_measurements tables)
@@ -231,12 +232,11 @@ Concretely:
   received for N s."
 - The audio alert (§9) plays.
 - The state machine transitions from `GUIDING` (or `ALERTED`) directly
-  to `REFERENCE_PENDING`. Box geometry, ridge coefficients, and targets
-  are preserved (they are detector-frame and durable), but the in-memory
-  reference image and reference 1-D profile are discarded, the rolling
+  to `REFERENCE_PENDING`. Stamp geometry is preserved (detector-frame
+  and durable), but the in-memory template is discarded, the rolling
   SUTR buffer is cleared, and the running statistics for out-of-family
-  detection are reset. The observer must click "Save Reference" on a
-  fresh frame before guiding can re-engage.
+  detection are reset. The observer must click "Build Template" on a
+  fresh `henNNNN.fits` before guiding can re-engage.
 
 The timer is **gated**: it only starts running once at least one guide
 image has been accepted, and it is **reset** whenever the watch directory
@@ -320,138 +320,156 @@ are never mixed across a reset.
 
 ### Bad-pixel mask
 
-Loaded once at startup from `files.bad_pixel_mask` (a FITS image, same shape
-as the science detector, 0 = good, 1 = bad — exact convention to be confirmed
-with William). Applied as a `numpy.ma.MaskedArray` so all downstream centroid
-and statistics steps naturally ignore masked pixels.
+Loaded once at startup from `files.bad_pixel_mask`. The Henrietta BPM is
+a multi-extension FITS file with seven HDUs:
 
-### Region geometry
+- **HDU 0** (primary; "Henrietta bad pixel mask") — the master mask, in
+  **`1 = good`** convention. Empirically ~0.3 % bad on the current
+  detector. **This is the only HDU the autoguider reads.**
+- **HDU 1 `COVERAGE`** (1 = illuminated science region; ~85 %).
+- **HDU 2 `DEAD`**, **HDU 3 `HOT`**, **HDU 4 `NOISY`**,
+  **HDU 5 `NOISY_DARK`**, **HDU 6 `REF_PIX`** — diagnostic categories
+  (1 = bad in that category). The H2RG reference pixels are flagged in
+  `REF_PIX` and already folded into the master HDU 0, so the autoguider
+  does **not** apply a separate reference-pixel correction; respecting
+  HDU 0 covers it.
 
-Each frame is processed in user-defined rectangular regions. There are up to
-**five boxes** per session:
+Applied as `numpy.ma.MaskedArray` (mask True where master == 0) so all
+downstream measurements ignore masked pixels.
 
-- 1 **science box** (required) — contains the trace.
-- 2 **science background boxes** — flank the science box; each independently
-  positioned and resizable. Default: same size as science, immediate flanking
-  with a small gap.
-- 1 **comparison box** (optional) — a second region on the spectrum;
-  measured the same way as the science box but does **not** drive the control
-  loop. For "is the science box in the right place?" diagnostics.
-- 2 **comparison background boxes** — flank the comparison box, same rules.
+### Stamp geometry
 
-Background subtraction is critical and may need to dodge neighbouring stars.
-Hence the boxes are independent and freely placed.
+Each frame is processed inside small rectangular **stamps**, not the full
+detector. Up to two per session:
 
-### Background subtraction
+- 1 **science stamp** (required) — covers the bright trace.
+  Parameterised by `(x_center, x_halfwidth, y_lo, y_hi)`. Typical sizes:
+  `x_halfwidth ≈ 25 px` (snug around the trace; ±25 covers a 6 px drift
+  with margin) and `y_lo..y_hi` spans the whole illuminated stripe
+  (filter cutoff to filter cutoff, e.g. `600..1980`). The wide Y range is
+  load-bearing — both Y-axis precision (from filter cutoffs and absorption
+  bands) and X-axis precision (from the continuum) come from the full
+  vertical extent.
+- 1 **comparison stamp** (optional) — a second region on the spectrum,
+  measured by the same algorithm but **never** drives the control loop.
+  For "is the science stamp positioned well?" diagnostics.
 
-For each (science | comparison) region:
+Stamps are drawn or numerically entered in the GUI. Geometries persist
+in `session.toml` so they survive across nights once set up.
 
-```
-sky_level = pooled_median( unmasked pixels in both bg boxes )
-science_box_pixels -= sky_level
-```
+### Local sky subtraction
 
-If the user disables bg subtraction, `sky_level = NaN` is recorded and no
-subtraction is applied.
-
-### Ridge geometry
-
-The dispersed trace is approximately linear over a box-sized region but is
-generally tilted (and slightly curved over the full detector). The ridge is
-parameterised by **two coefficients**:
-
-```
-X_ridge(Y) = ridge_x_center + tan(ridge_angle_deg · π/180) · (Y − Y_DETECTOR_MIDDLE)
-```
-
-- `ridge_x_center`: X-pixel where the ridge crosses the detector's
-  middle row (`detector.y_middle_row` in config). Anchored to a fixed global
-  reference so the parameter has stable physical meaning regardless of where
-  the science box is placed.
-- `ridge_angle_deg`: tilt from vertical, in degrees.
-
-Ridge degree is fixed at 1 (linear) for v1; the config field
-`reduction.ridge_degree` is reserved for future quadratic support.
-
-The ridge is fit fresh on each new target (it shouldn't change much between
-adjacent targets but might, e.g., with focus or rotator-state changes; we
-record it per-frame in the database for retrospective study).
-
-### Reference / calibration step
-
-After the user draws boxes on a high-SNR integrated frame (typically the
-final `_sss` of the first integration on a target):
-
-1. Background-subtract the science box.
-2. For each row Y in the box, compute the column centroid of the
-   cross-section (1-D Gaussian fit or weighted COM).
-3. Fit `(ridge_x_center, ridge_angle_deg)` linearly to those row centroids.
-4. Extract the 1-D **reference flux profile** along the ridge:
-   `f_ref(Y)`. This carries any spectral structure useful for Y locking.
-5. Store all of the above as the **reference** for this target; persist
-   `(ridge_x_center, ridge_angle_deg)` in `session.toml`.
-
-#### Auto-fit acceptance criterion and failure handling
-
-A ridge fit is **accepted** if all of the following hold:
-
-- The number of rows with a successful per-row centroid (SNR above a
-  configurable threshold, default 5σ over sky noise) is at least
-  `reduction.min_ridge_rows` (default 20).
-- The median absolute residual `|X_centroid(Y) − X_ridge(Y)|` over those
-  rows is below `reduction.max_ridge_residual_px` (default 0.5 px).
-- The fit's matrix is non-singular and the recovered angle is within
-  `reduction.max_ridge_angle_deg` of vertical (default ±10°).
-
-If any check fails, the GUI emits an `ERROR`-level banner ("Ridge auto-fit
-failed: <reason>") and remains in **IDLE**. The user can then either
-redraw the box on a cleaner region, manually enter `(ridge_x_center,
-ridge_angle_deg)`, or click two trace points and re-fit. The state machine
-transitions to `REFERENCE_PENDING` only when a fit is either auto-accepted
-or manually saved.
-
-Manual override: the GUI lets the user adjust `ridge_x_center` and
-`ridge_angle_deg` by direct numeric entry, by dragging two handles on the
-ridge overlay, or by clicking two points along the visible trace and
-re-fitting. After any adjustment, "Save Reference" locks the result.
-
-### Per-frame measurement
-
-For each guide image:
-
-1. Apply the bad-pixel mask.
-2. Subtract the sky level from each region's bg-box median.
-3. **dX** (cross-dispersion shift, science box):
-   - For each row Y, centroid the cross-section in a narrow window around
-     `X_ridge(Y)` (window width configurable, default ≈ 5 × FWHM).
-   - `δx(Y) = X_centroid(Y) − X_ridge(Y)`.
-   - Robust mean (sigma-clipped, weighted by row SNR) over Y → `dX_px`.
-4. **dY** (dispersion-direction shift):
-   - Extract current 1-D profile along the (translated) ridge.
-   - Cross-correlate with `f_ref`; sub-pixel peak via parabolic fit
-     → `dY_px`.
-5. **Trace FWHM** (along the spatial X axis): collapse the box along Y,
-   1-D Gaussian fit → FWHM in pixels. Stored as `trace_fwhm_x_px`.
-6. **Trace flux**: sum of bg-subtracted, mask-applied pixels in the science
-   box. Stored as `trace_flux_adu`.
-7. `sky_background_adu`: pooled median from above.
-8. **Comparison box** runs the same pipeline against its own reference;
-   results are stored but **never** drive the control loop.
-
-The user enters two **commandable targets**:
-
-- `desired_ridge_x_px` — where the ridge should cross the middle row.
-- `desired_ridge_y_px` — where the reference flux profile's Y anchor
-  should land.
-
-Per-frame error in pixel space:
+Each stamp does its own row-by-row sky subtraction internally — there
+are no separate flanking background boxes. For each row Y of the stamp:
 
 ```
-err_x_px = desired_ridge_x_px − (current_ridge_x_center + dX_px)
-err_y_px = desired_ridge_y_px − (current_ridge_y_anchor + dY_px)
+edge      = stamp_width // 6
+sky_row_y = median( pixels in [stamp_x_min..stamp_x_min + edge] ∪
+                              [stamp_x_max − edge..stamp_x_max], row Y,
+                    masking out BPM-bad pixels )
+stamp[Y, :] -= sky_row_y
 ```
 
-These are converted to sky offsets (§6).
+The outer 1/6 of the stamp on each side is treated as sky; their median
+defines the sky pedestal for that row. This removes detector pedestal
+differences between reads, sky-background gradients along the trace, and
+slow per-frame H2RG bias drift — all of which would otherwise bias the
+cross-correlation peak away from the structure that carries position
+information.
+
+The per-row-per-stamp `sky_row_y` values are summarised as a single
+`sky_background_adu` (median across rows) for the per-frame archive and
+the time-series plot.
+
+### Template build
+
+The reference (= the "where I want the trace to live") is captured as a
+**2-D template image**, not as a fitted ridge.
+
+When the user clicks **"Build Template"** in the GUI, the source frame
+is the most recent **`henNNNN.fits`** — the slope-fit final image
+produced by the Archon at the end of an integration. This is the
+highest-S/N representation of the trace available because it combines
+all SUTR samples through the slope fit. The autoguider extracts the
+science stamp (and optionally the comparison stamp) from that file,
+applies the BPM, and runs the local sky subtraction described above.
+The resulting bg-subtracted, masked stamp **is** the template `T(x, y)`.
+
+For long sequences (≳ 5 minutes of guiding), the template can be allowed
+to slide: each new `henNNNN.fits` replaces the template, removing
+systematics from slow shape evolution (water vapour, airmass, thermal
+drift) without sacrificing precision. Off by default for v1
+(`reduction.sliding_template = false`); turn on if a target needs it.
+
+If no `henNNNN.fits` is available yet (e.g., the user clicks Build
+Template very early in the first integration), the GUI declines and
+prompts the user to wait for the slope-fit file to land.
+
+The template is held in memory during a session and is **not** persisted
+across restarts — it must be re-built each time the autoguider starts.
+
+### Per-frame measurement (2-D cross-correlation)
+
+For each new guide image (a K-window SUTR difference, see "SUTR
+difference model" above):
+
+1. Apply the BPM master mask.
+2. Apply local sky subtraction (per-row outer 1/6 medians) — same
+   procedure used when building the template.
+3. **2-D cross-correlation** of the bg-subtracted, masked guide image
+   `D(x, y)` against the template `T(x, y)`. Brute-force evaluation
+   over a ±`reduction.xcor_search_radius_px` window (default 12 px) in
+   both axes:
+
+   ```
+   C(δx, δy) = Σ_y Σ_x  T(x, y) · D(x + δx, y + δy)
+   ```
+
+   Implemented vectorised in NumPy; at our stamp size (~70 k pixels) and
+   search size (25×25 = 625 evaluations) this is well under 100 ms per
+   frame.
+4. **Sub-pixel peak refinement.** Find the integer-shift maximum
+   `(δx_peak, δy_peak)` of `C`. Fit a parabola to the three correlation
+   values around the peak in each axis independently:
+
+   ```
+   For X (at the peak's row):
+       a, b, c = C(δx_peak − 1, δy_peak), C(δx_peak, δy_peak),
+                 C(δx_peak + 1, δy_peak)
+       sub_x   = 0.5·(a − c) / (a − 2b + c)
+       dx_px   = δx_peak + sub_x
+
+   For Y (at the peak's column): same thing.
+   ```
+
+   The curvature `(a − 2b + c)` in each axis is recorded per frame and
+   serves as a proxy for the formal centroid uncertainty (sharper peak
+   ↔ better-pinned shift).
+5. **Comparison stamp** runs steps 1–4 against its own template and is
+   stored alongside, but does **not** drive the control loop.
+
+The result `(dx_px, dy_px)` is the science stamp's drift relative to its
+template. Because the template embodies the desired trace position,
+there is **no separate "commandable target"** — driving `(dx_px, dy_px)`
+toward zero is what the controller does. (If the operator wants to lock
+to a different position, they re-build the template after slewing.)
+
+Per-frame quantities recorded for analysis:
+
+- `dx_px`, `dy_px` — the xcor-measured shift in pixel space.
+- `xcor_curvature_x`, `xcor_curvature_y` — parabola curvatures (formal
+  precision indicator).
+- `xcor_peak_value` — the peak correlation value (low = poor SNR /
+  template mismatch).
+- `trace_fwhm_x_px` — FWHM from a 1-D Gaussian fit to the column-summed
+  template-aligned profile (still useful as a seeing diagnostic).
+- `trace_flux_adu` — sum of bg-subtracted, mask-applied pixels in the
+  stamp.
+- `sky_background_adu` — median of per-row sky pedestals.
+- `template_frame_number` — which `henNNNN.fits` produced the active
+  template, for retrospective traceability.
+
+`(dx_px, dy_px)` are converted to sky offsets (§6).
 
 ## 5. Quality control & alerts
 

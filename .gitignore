@@ -1,5 +1,7 @@
-# Local test data (large; not committed — fetch from external drive as needed)
+# Local test data and large calibration files (not committed)
 test/
+bpm_*.fits
+*.fits
 
 # uv / Python
 .venv/
