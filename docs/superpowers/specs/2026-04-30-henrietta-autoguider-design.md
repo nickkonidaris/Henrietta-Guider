@@ -8,11 +8,11 @@
 ## 1. Purpose & scope
 
 The Henrietta autoguider keeps the science spectrum on the same detector pixels
-during long IR-spectroscopic observations on the Swope telescope. It runs on
-the Henrietta instrument computer, watches a directory for SUTR (sample-up-the-
-ramp) FITS frames produced by the DAQ, measures the trace position relative to
-a calibrated reference, and sends small (±2.5″) telescope offsets to the TCS
-over TCP/IP to bring the trace back on target.
+during long IR-spectroscopic observations on the Swope telescope. It runs on the
+Henrietta instrument computer, watches a directory for SUTR (sample-up-the-
+ramp) FITS frames produced by the Archon Ctonroller, measures the trace position
+relative to a calibrated reference, and sends small (±2.5″) telescope offsets to
+the TCS over TCP/IP to bring the trace back on target.
 
 In addition to its closed-loop function, every measurement is archived in
 SQLite indexed by HA / Dec so that long-term records can be mined for
@@ -39,14 +39,15 @@ non-periodic mount errors.
 - A dedicated cosmic-ray rejection algorithm (medianing throughout the
   pipeline + the bad-pixel mask are sufficient — see §11).
 - Online updates to the bad-pixel mask (loaded once at startup).
-- High-refresh-rate live image display (loop runs at ≤ ~1 Hz; Tk + matplotlib
+- High-refresh-rate live image display (loop runs at ≤ ~0.5 Hz; Tk + matplotlib
   is sized for that).
 
 ## 2. System overview
 
+note the directories here are notional:
 ```
 ┌────────────────────────┐         ┌────────────────────────┐
-│  DAQ (separate system) │  FITS   │  Watch directory       │
+│  Archon (separate system) │  FITS   │  Watch directory       │
 │  writes henNNNN_sss.fits ─────►  │  /data/<night>/...     │
 └────────────────────────┘         └──────────┬─────────────┘
                                               │ atomic rename → on_moved
@@ -70,9 +71,13 @@ non-periodic mount errors.
                                 plots, alerts, controls.
 ```
 
-The autoguider knows nothing about exposure boundaries, the TCS's pointing
-state, or what the observer is doing. Its world is "files appear in a
-directory; emit corrections and rows."
+The guider only applies corrections within one exposure's SUTRs — it
+infers a new exposure has begun by noticing a new `NNNN` in the filename
+and discards its rolling-read buffer at that point. There is no
+out-of-band signal from the DAQ or TCS: no "exposure starting / ending"
+notification, no pointing-state readback, no acknowledgment of
+corrections. The guider's world is "FITS files appear in a directory;
+emit corrections and rows."
 
 ### Wire-protocol context (recap; full spec in `Wireformat.md`)
 
