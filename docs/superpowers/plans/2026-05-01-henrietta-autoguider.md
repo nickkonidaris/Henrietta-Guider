@@ -3421,3 +3421,685 @@ violations, target switches, and stale-frame conditions — but not yet
 glued into a `MeasurementRow` pipeline.
 
 ---
+
+## Chunk 5: Reducer and persistence
+
+**Goal:** Land the per-SUTR orchestrator (`reducer.py`) that wires
+together the framebuffer + sky + xcor + signal_snr pipeline, plus the
+SQLite store (`store.py`). After this chunk, every SUTR can produce a
+`MeasurementRow` and persist it to disk; the worker thread (Chunk 6) is
+the only thing missing for end-to-end operation.
+
+### Task 5.1: MeasurementRow + Reducer
+
+**Files:**
+- Modify: `henrietta_guider/core/types.py` (add `MeasurementRow` dataclass)
+- Create: `henrietta_guider/core/reducer.py`
+- Create: `tests/unit/test_reducer.py`
+
+`MeasurementRow` is a frozen dataclass holding everything one SUTR
+contributes for one stamp. Because not every SUTR produces a guide
+image (warmup of the K-window buffer takes 2K reads on a fresh frame),
+the xcor-related fields are `Optional[float]` and `signal_snr` is
+always present.
+
+`Reducer` owns `FrameBuffer`, `SanityChecker`, the reset-read for the
+current frame, and detector parameters (gain). Given a new
+`(frame_number, sutr_number, raw_read)` plus a `Stamp` + `Template`,
+it returns a `MeasurementRow` (or signals discard via the SanityVerdict).
+
+- [ ] **Step 1: Append `MeasurementRow` to `core/types.py`.**
+
+```python
+@dataclass(frozen=True)
+class MeasurementRow:
+    """One row per (frame_number, sutr_number, stamp_id) in stamp_measurements.
+
+    xcor_* and trace_* fields are None when the K-window framebuffer
+    has not yet warmed up on the current frame (no guide image). The
+    signal_snr is always computed (it only needs the cumulative
+    raw_read - reset_read per pixel).
+    """
+
+    frame_number: int
+    sutr_number: int
+    stamp_id: int                       # 0 = science, 1+ = comparison
+
+    # Always populated:
+    signal_snr: float | None            # None if zero unmasked pixels
+
+    # Populated only when the framebuffer emits a guide image:
+    dx_px: float | None
+    dy_px: float | None
+    xcor_peak_value: float | None
+    xcor_curvature_x: float | None
+    xcor_curvature_y: float | None
+    trace_fwhm_x_px: float | None
+    trace_flux_adu: float | None
+    sky_background_adu: float | None
+
+    # Provenance:
+    stamp_x_center: int
+    stamp_x_halfwidth: int
+    stamp_y_lo: int
+    stamp_y_hi: int
+    template_frame_number: int | None   # which henNNNN.fits built the template
+    quality_flags: tuple[str, ...] = ()
+```
+
+- [ ] **Step 2: Failing tests in `tests/unit/test_reducer.py`.**
+
+```python
+import numpy as np
+import pytest
+
+from henrietta_guider.core.reducer import Reducer
+from henrietta_guider.core.template import Template
+from henrietta_guider.core.types import Stamp
+
+
+def _full_frame(value: float, ny: int = 2048, nx: int = 2048) -> np.ndarray:
+    return np.full((ny, nx), value, dtype=np.float32)
+
+
+def _stamp() -> Stamp:
+    return Stamp(x_center=110, x_halfwidth=25, y_lo=600, y_hi=1980)
+
+
+def _template(stamp: Stamp, frame_number: int = 1) -> Template:
+    img = np.zeros(stamp.shape, dtype=np.float32)
+    # Add a Gaussian trace down the middle so xcor has something to find.
+    sigma = 1.5
+    x_c = stamp.shape[1] // 2
+    x = np.arange(stamp.shape[1])[None, :]
+    img += 1000.0 * np.exp(-((x - x_c) ** 2) / (2 * sigma**2))
+    good = np.ones(stamp.shape, dtype=bool)
+    return Template(image=img, good=good, frame_number=frame_number, stamp=stamp)
+
+
+@pytest.mark.unit
+class TestReducer:
+    def _make(self, K: int = 1, stride: int = 1) -> Reducer:
+        good_full = np.ones((2048, 2048), dtype=bool)
+        return Reducer(K=K, stride=stride, gain_e_per_dn=4.0, bpm_good=good_full)
+
+    def test_first_sutr_no_guide_image_but_signal_snr_zero(self):
+        red = self._make()
+        stamp, tmpl = _stamp(), _template(_stamp())
+        # Frame 10, SUTR 1 (the reset read): no guide image yet.
+        rows = red.reduce_sutr(
+            frame_number=10, sutr_number=1, raw_read=_full_frame(50.0),
+            stamps_and_templates=[(stamp, tmpl, 0)],
+        )
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.dx_px is None  # no guide image yet
+        # signal_DN = read - reset_read = 0 -> signal_snr = sqrt(0) = 0.
+        assert row.signal_snr == pytest.approx(0.0)
+
+    def test_second_sutr_emits_guide_image_and_xcor(self):
+        red = self._make()
+        stamp, tmpl = _stamp(), _template(_stamp())
+        # SUTR 1: reset.
+        red.reduce_sutr(
+            frame_number=10, sutr_number=1, raw_read=_full_frame(50.0),
+            stamps_and_templates=[(stamp, tmpl, 0)],
+        )
+        # SUTR 2: a slightly different read; FrameBuffer (K=1) emits.
+        rows = red.reduce_sutr(
+            frame_number=10, sutr_number=2,
+            raw_read=_full_frame(50.0) + 1.0,    # +1 DN added everywhere
+            stamps_and_templates=[(stamp, tmpl, 0)],
+        )
+        row = rows[0]
+        assert row.dx_px is not None
+        assert row.dy_px is not None
+        assert row.xcor_peak_value is not None
+        # Signal snr: signal_DN = (50+1) - 50 = 1 per pixel; in unmasked
+        # stamp (51 × 1380 = 70380 px), total e- = 70380 * 1 * 4 = 281520;
+        # snr = sqrt(281520) ≈ 530.
+        assert row.signal_snr == pytest.approx(530.0, rel=0.05)
+
+    def test_frame_boundary_resets_reset_read_and_buffer(self):
+        red = self._make()
+        stamp, tmpl = _stamp(), _template(_stamp())
+        # Two reads on frame 10:
+        red.reduce_sutr(10, 1, _full_frame(50.0),
+                        stamps_and_templates=[(stamp, tmpl, 0)])
+        red.reduce_sutr(10, 2, _full_frame(60.0),
+                        stamps_and_templates=[(stamp, tmpl, 0)])
+        # New frame 11, SUTR 1 — buffer cleared, no guide image.
+        rows = red.reduce_sutr(11, 1, _full_frame(80.0),
+                               stamps_and_templates=[(stamp, tmpl, 0)])
+        assert rows[0].dx_px is None
+        # signal_snr now relative to frame 11's reset (80.0 itself), so
+        # signal_DN = 0 -> signal_snr ≈ 0.
+        assert rows[0].signal_snr == pytest.approx(0.0)
+
+    def test_sanity_discard_returns_empty(self):
+        red = self._make()
+        stamp, tmpl = _stamp(), _template(_stamp())
+        red.reduce_sutr(10, 1, _full_frame(50.0),
+                        stamps_and_templates=[(stamp, tmpl, 0)])
+        red.reduce_sutr(10, 2, _full_frame(50.0),
+                        stamps_and_templates=[(stamp, tmpl, 0)])
+        # Out-of-order SUTR: must return [] (discarded).
+        rows = red.reduce_sutr(10, 1, _full_frame(50.0),
+                               stamps_and_templates=[(stamp, tmpl, 0)])
+        assert rows == []
+
+    def test_two_stamps_yields_two_rows(self):
+        red = self._make()
+        sci_stamp = Stamp(x_center=110, x_halfwidth=25, y_lo=600, y_hi=1980)
+        cmp_stamp = Stamp(x_center=400, x_halfwidth=25, y_lo=600, y_hi=1980)
+        sci_tmpl  = _template(sci_stamp)
+        cmp_tmpl  = _template(cmp_stamp)
+        red.reduce_sutr(10, 1, _full_frame(50.0),
+                        stamps_and_templates=[(sci_stamp, sci_tmpl, 0),
+                                              (cmp_stamp, cmp_tmpl, 1)])
+        rows = red.reduce_sutr(10, 2, _full_frame(50.0) + 1.0,
+                               stamps_and_templates=[(sci_stamp, sci_tmpl, 0),
+                                                     (cmp_stamp, cmp_tmpl, 1)])
+        assert len(rows) == 2
+        ids = {r.stamp_id for r in rows}
+        assert ids == {0, 1}
+```
+
+- [ ] **Step 3: Run; confirm fail.**
+
+- [ ] **Step 4: Implement `core/reducer.py`.**
+
+```python
+"""Per-SUTR orchestrator.
+
+Reducer.reduce_sutr() takes one new raw read plus a list of
+(Stamp, Template, stamp_id) tuples and produces one MeasurementRow per
+stamp. It owns:
+
+  - SanityChecker  (rejects out-of-order SUTRs / backwards frames)
+  - FrameBuffer    (rolling K-window diff buffer)
+  - reset_read     (this frame's _001 read; for signal_snr)
+  - gain_e_per_dn  (detector gain)
+  - bpm_good       (full-detector good-pixel mask)
+
+It does not do anything I/O-related; the worker thread reads the FITS,
+calls reduce_sutr(), and persists the resulting rows.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from .framebuffer import FrameBuffer
+from .sanity import SanityAction, SanityChecker
+from .sky import subtract_local_sky
+from .template import Template
+from .types import MeasurementRow, Stamp
+from .xcor import xcor_2d
+
+
+class Reducer:
+    def __init__(
+        self,
+        K: int,
+        stride: int,
+        gain_e_per_dn: float,
+        bpm_good: np.ndarray,
+        xcor_search: int = 12,
+    ) -> None:
+        self.framebuffer = FrameBuffer(K=K, stride=stride)
+        self.sanity = SanityChecker()
+        self.gain_e_per_dn = gain_e_per_dn
+        self.bpm_good = bpm_good
+        self.xcor_search = xcor_search
+        self._reset_read: np.ndarray | None = None
+        self._reset_read_frame: int | None = None
+
+    def reduce_sutr(
+        self,
+        frame_number: int,
+        sutr_number: int,
+        raw_read: np.ndarray,
+        stamps_and_templates: list[tuple[Stamp, Template, int]],
+    ) -> list[MeasurementRow]:
+        verdict = self.sanity.check(frame_number, sutr_number)
+        if verdict.action is SanityAction.WARN_DISCARD:
+            return []
+
+        # On a new frame, capture this read as the reset.
+        if self._reset_read_frame != frame_number:
+            self._reset_read = raw_read.copy()
+            self._reset_read_frame = frame_number
+
+        # K-window difference (None if buffer not warm yet).
+        guide_image = self.framebuffer.add(frame_number, sutr_number, raw_read)
+
+        rows: list[MeasurementRow] = []
+        for stamp, template, stamp_id in stamps_and_templates:
+            rows.append(self._reduce_one_stamp(
+                frame_number, sutr_number, stamp_id, raw_read, guide_image,
+                stamp, template, verdict.tags,
+            ))
+        return rows
+
+    # ---- internal --------------------------------------------------------
+
+    def _reduce_one_stamp(
+        self,
+        frame: int, sutr: int, stamp_id: int,
+        raw_read: np.ndarray,
+        guide_image: np.ndarray | None,
+        stamp: Stamp,
+        template: Template,
+        sanity_tags: tuple[str, ...],
+    ) -> MeasurementRow:
+        good_stamp = self.bpm_good[
+            stamp.y_lo : stamp.y_hi, stamp.x_min : stamp.x_max,
+        ]
+
+        # signal_snr (always computed; relative to current frame's reset).
+        snr = self._signal_snr(raw_read, stamp, good_stamp)
+
+        # If no guide image yet, return early with xcor/trace fields None.
+        if guide_image is None:
+            return MeasurementRow(
+                frame_number=frame, sutr_number=sutr, stamp_id=stamp_id,
+                signal_snr=snr,
+                dx_px=None, dy_px=None,
+                xcor_peak_value=None, xcor_curvature_x=None, xcor_curvature_y=None,
+                trace_fwhm_x_px=None, trace_flux_adu=None, sky_background_adu=None,
+                stamp_x_center=stamp.x_center, stamp_x_halfwidth=stamp.x_halfwidth,
+                stamp_y_lo=stamp.y_lo, stamp_y_hi=stamp.y_hi,
+                template_frame_number=template.frame_number,
+                quality_flags=sanity_tags,
+            )
+
+        # Sky-subtract the guide-image stamp.
+        gi_stamp = guide_image[
+            stamp.y_lo : stamp.y_hi, stamp.x_min : stamp.x_max,
+        ]
+        sub, per_row_sky = subtract_local_sky(gi_stamp, good_stamp)
+        sub = np.where(good_stamp, sub, 0.0)
+
+        # 2-D xcor against the template.
+        xc = xcor_2d(sub, template.image, search=self.xcor_search)
+
+        # Trace summary stats.
+        flux = float(np.sum(np.where(good_stamp, sub, 0.0)))
+        sky_bg = float(np.median(per_row_sky))
+        fwhm = self._trace_fwhm(sub)
+
+        return MeasurementRow(
+            frame_number=frame, sutr_number=sutr, stamp_id=stamp_id,
+            signal_snr=snr,
+            dx_px=xc.dx_px, dy_px=xc.dy_px,
+            xcor_peak_value=xc.peak_value,
+            xcor_curvature_x=xc.curvature_x,
+            xcor_curvature_y=xc.curvature_y,
+            trace_fwhm_x_px=fwhm,
+            trace_flux_adu=flux,
+            sky_background_adu=sky_bg,
+            stamp_x_center=stamp.x_center, stamp_x_halfwidth=stamp.x_halfwidth,
+            stamp_y_lo=stamp.y_lo, stamp_y_hi=stamp.y_hi,
+            template_frame_number=template.frame_number,
+            quality_flags=sanity_tags,
+        )
+
+    def _signal_snr(
+        self,
+        raw_read: np.ndarray,
+        stamp: Stamp,
+        good_stamp: np.ndarray,
+    ) -> float | None:
+        if self._reset_read is None:
+            return None
+        sig_DN = (
+            raw_read[stamp.y_lo : stamp.y_hi, stamp.x_min : stamp.x_max]
+            - self._reset_read[stamp.y_lo : stamp.y_hi, stamp.x_min : stamp.x_max]
+        )
+        sig_e = float(np.sum(np.where(good_stamp, sig_DN, 0.0))) * self.gain_e_per_dn
+        if sig_e <= 0.0:
+            return 0.0
+        return float(np.sqrt(sig_e))
+
+    def _trace_fwhm(self, sub: np.ndarray) -> float:
+        # Collapse along Y to a 1-D spatial profile, fit a Gaussian
+        # FWHM. Cheap second-moment estimate is fine for v1.
+        profile = sub.sum(axis=0)
+        if profile.sum() <= 0:
+            return float("nan")
+        x = np.arange(profile.size)
+        x_mean = float(np.sum(x * profile) / np.sum(profile))
+        x_var  = float(np.sum((x - x_mean) ** 2 * profile) / np.sum(profile))
+        if x_var <= 0:
+            return float("nan")
+        sigma = np.sqrt(x_var)
+        return float(2.355 * sigma)
+```
+
+- [ ] **Step 5: Run; confirm green.**
+
+- [ ] **Step 6: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/core/reducer.py henrietta_guider/core/types.py tests/unit/test_reducer.py
+git commit -m "core: per-SUTR reducer + MeasurementRow type"
+```
+
+### Task 5.2: SQLite store
+
+**Files:**
+- Create: `henrietta_guider/core/store.py`
+- Create: `tests/unit/test_store.py`
+
+WAL-mode SQLite database with the two-table schema from spec §7.
+`Store.open(path)` creates the file + schema if missing, opens in WAL,
+and returns a context-manager-friendly object. `Store.write_frame(...)`
+inserts one row into `frames` plus one row per stamp into
+`stamp_measurements`. Writes are not transactional across frames (one
+commit per call) — crash recovery may lose the last few rows, which is
+acceptable per spec §7.
+
+- [ ] **Step 1: Failing tests.**
+
+```python
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from henrietta_guider.core.store import FrameRecord, Store
+from henrietta_guider.core.types import MeasurementRow
+
+
+@pytest.mark.unit
+class TestStore:
+    def _row(self, frame: int = 10, sutr: int = 5, stamp_id: int = 0,
+             dx: float | None = 0.05) -> MeasurementRow:
+        return MeasurementRow(
+            frame_number=frame, sutr_number=sutr, stamp_id=stamp_id,
+            signal_snr=210.0, dx_px=dx, dy_px=-0.02,
+            xcor_peak_value=1.23e6, xcor_curvature_x=-1500.0,
+            xcor_curvature_y=-1700.0, trace_fwhm_x_px=3.4,
+            trace_flux_adu=1.84e5, sky_background_adu=62.1,
+            stamp_x_center=110, stamp_x_halfwidth=25,
+            stamp_y_lo=600, stamp_y_hi=1980,
+            template_frame_number=42, quality_flags=("frame_skip",),
+        )
+
+    def _frame(self, frame: int = 10, sutr: int = 5) -> FrameRecord:
+        return FrameRecord(
+            frame_number=frame, sutr_number=sutr,
+            timestamp_utc="2026-04-30T08:14:22.137",
+            frame_path=f"/data/2026-04-30/hen{frame:04d}_{sutr:03d}r.fits",
+            ramp_complete=False,
+            ha_hours=1.234, dec_deg=-29.501, pa_deg=45.0, airmass=1.18,
+            temperature_c=-50.0, focus_position=12345.0,
+            cmd_ra_arcsec=0.0, cmd_dec_arcsec=0.05,
+            cmd_suppressed_by=None,
+            err_ra_arcsec=0.018, err_dec_arcsec=0.052,
+            guiding_state="GUIDING",
+        )
+
+    def test_creates_schema_in_new_file(self, tmp_path: Path):
+        db = tmp_path / "test.db"
+        with Store.open(db) as st:
+            pass
+        # Schema should exist.
+        with sqlite3.connect(db) as conn:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+        assert "frames" in tables
+        assert "stamp_measurements" in tables
+
+    def test_wal_mode_set(self, tmp_path: Path):
+        db = tmp_path / "wal.db"
+        with Store.open(db) as st:
+            cursor = st._conn.execute("PRAGMA journal_mode")
+            assert cursor.fetchone()[0].lower() == "wal"
+
+    def test_write_frame_round_trip(self, tmp_path: Path):
+        db = tmp_path / "roundtrip.db"
+        with Store.open(db) as st:
+            frame = self._frame()
+            row = self._row()
+            st.write_frame(frame, [row])
+            # Read back via a fresh connection.
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                f_row = conn.execute(
+                    "SELECT * FROM frames WHERE frame_number=10 AND sutr_number=5"
+                ).fetchone()
+                assert f_row["timestamp_utc"] == frame.timestamp_utc
+                assert f_row["guiding_state"] == "GUIDING"
+                m_row = conn.execute(
+                    "SELECT * FROM stamp_measurements "
+                    "WHERE frame_number=10 AND sutr_number=5 AND stamp_id=0"
+                ).fetchone()
+                assert m_row["dx_px"] == pytest.approx(0.05)
+                assert json.loads(m_row["quality_flags"]) == ["frame_skip"]
+
+    def test_write_frame_with_two_stamps(self, tmp_path: Path):
+        db = tmp_path / "two.db"
+        with Store.open(db) as st:
+            frame = self._frame()
+            sci = self._row(stamp_id=0, dx=0.1)
+            cmp_ = self._row(stamp_id=1, dx=0.2)
+            st.write_frame(frame, [sci, cmp_])
+            with sqlite3.connect(db) as conn:
+                rows = conn.execute(
+                    "SELECT stamp_id, dx_px FROM stamp_measurements "
+                    "WHERE frame_number=10 AND sutr_number=5 ORDER BY stamp_id"
+                ).fetchall()
+                assert rows == [(0, pytest.approx(0.1)), (1, pytest.approx(0.2))]
+
+    def test_indexes_present(self, tmp_path: Path):
+        db = tmp_path / "idx.db"
+        with Store.open(db) as st:
+            indexes = {r[0] for r in st._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )}
+        assert "idx_frames_time" in indexes
+        assert "idx_frames_hadec" in indexes
+```
+
+- [ ] **Step 2: Run; confirm fail.**
+
+- [ ] **Step 3: Implement `core/store.py`.**
+
+```python
+"""SQLite store for the per-frame measurement archive.
+
+Two tables (spec §7):
+  - frames               one row per (frame_number, sutr_number)
+  - stamp_measurements   one row per (frame_number, sutr_number, stamp_id)
+
+WAL mode so reads (analysis tools) don't block writes. One commit per
+write_frame() call; no explicit transaction across frames.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+from .types import MeasurementRow
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS frames (
+    frame_number       INTEGER NOT NULL,
+    sutr_number        INTEGER NOT NULL,
+    timestamp_utc      TEXT,
+    frame_path         TEXT,
+    ramp_complete      INTEGER,
+    ha_hours           REAL,
+    dec_deg            REAL,
+    pa_deg             REAL,
+    airmass            REAL,
+    temperature_c      REAL,
+    focus_position     REAL,
+    cmd_ra_arcsec      REAL,
+    cmd_dec_arcsec     REAL,
+    cmd_suppressed_by  TEXT,
+    err_ra_arcsec      REAL,
+    err_dec_arcsec     REAL,
+    guiding_state      TEXT,
+    PRIMARY KEY (frame_number, sutr_number)
+);
+
+CREATE TABLE IF NOT EXISTS stamp_measurements (
+    frame_number          INTEGER NOT NULL,
+    sutr_number           INTEGER NOT NULL,
+    stamp_id              INTEGER NOT NULL,
+    stamp_x_center        INTEGER,
+    stamp_x_halfwidth     INTEGER,
+    stamp_y_lo            INTEGER,
+    stamp_y_hi            INTEGER,
+    template_frame_number INTEGER,
+    dx_px                 REAL,
+    dy_px                 REAL,
+    xcor_peak_value       REAL,
+    xcor_curvature_x      REAL,
+    xcor_curvature_y      REAL,
+    trace_fwhm_x_px       REAL,
+    trace_flux_adu        REAL,
+    sky_background_adu    REAL,
+    signal_snr            REAL,
+    quality_flags         TEXT,
+    PRIMARY KEY (frame_number, sutr_number, stamp_id),
+    FOREIGN KEY (frame_number, sutr_number)
+        REFERENCES frames(frame_number, sutr_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_frames_time  ON frames(timestamp_utc);
+CREATE INDEX IF NOT EXISTS idx_frames_hadec ON frames(ha_hours, dec_deg);
+"""
+
+
+@dataclass(frozen=True)
+class FrameRecord:
+    """One row's worth of frame-level metadata (the science box's command,
+    error, and per-frame state). Mirrors the `frames` table."""
+    frame_number: int
+    sutr_number: int
+    timestamp_utc: str
+    frame_path: str
+    ramp_complete: bool
+    ha_hours: float | None
+    dec_deg: float | None
+    pa_deg: float | None
+    airmass: float | None
+    temperature_c: float | None
+    focus_position: float | None
+    cmd_ra_arcsec: float | None
+    cmd_dec_arcsec: float | None
+    cmd_suppressed_by: str | None
+    err_ra_arcsec: float | None
+    err_dec_arcsec: float | None
+    guiding_state: str
+
+
+class Store:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    @classmethod
+    @contextmanager
+    def open(cls, path: str | Path):
+        p = Path(path).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(p))
+        try:
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.executescript(_SCHEMA)
+            conn.commit()
+            yield cls(conn)
+        finally:
+            conn.close()
+
+    def write_frame(self, frame: FrameRecord, rows: list[MeasurementRow]) -> None:
+        self._conn.execute(
+            """INSERT OR REPLACE INTO frames
+               (frame_number, sutr_number, timestamp_utc, frame_path,
+                ramp_complete, ha_hours, dec_deg, pa_deg, airmass,
+                temperature_c, focus_position,
+                cmd_ra_arcsec, cmd_dec_arcsec, cmd_suppressed_by,
+                err_ra_arcsec, err_dec_arcsec, guiding_state)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                frame.frame_number, frame.sutr_number, frame.timestamp_utc,
+                frame.frame_path, int(frame.ramp_complete),
+                frame.ha_hours, frame.dec_deg, frame.pa_deg, frame.airmass,
+                frame.temperature_c, frame.focus_position,
+                frame.cmd_ra_arcsec, frame.cmd_dec_arcsec,
+                frame.cmd_suppressed_by, frame.err_ra_arcsec,
+                frame.err_dec_arcsec, frame.guiding_state,
+            ),
+        )
+        for row in rows:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO stamp_measurements
+                   (frame_number, sutr_number, stamp_id,
+                    stamp_x_center, stamp_x_halfwidth, stamp_y_lo, stamp_y_hi,
+                    template_frame_number, dx_px, dy_px,
+                    xcor_peak_value, xcor_curvature_x, xcor_curvature_y,
+                    trace_fwhm_x_px, trace_flux_adu, sky_background_adu,
+                    signal_snr, quality_flags)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    row.frame_number, row.sutr_number, row.stamp_id,
+                    row.stamp_x_center, row.stamp_x_halfwidth,
+                    row.stamp_y_lo, row.stamp_y_hi,
+                    row.template_frame_number, row.dx_px, row.dy_px,
+                    row.xcor_peak_value, row.xcor_curvature_x,
+                    row.xcor_curvature_y, row.trace_fwhm_x_px,
+                    row.trace_flux_adu, row.sky_background_adu,
+                    row.signal_snr,
+                    json.dumps(list(row.quality_flags)),
+                ),
+            )
+        self._conn.commit()
+```
+
+- [ ] **Step 4: Run; confirm green.**
+
+- [ ] **Step 5: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/core/store.py tests/unit/test_store.py
+git commit -m "core: SQLite store (frames + stamp_measurements, WAL)"
+```
+
+### Task 5.3: End-of-chunk verification
+
+- [ ] **Step 1: Run full suite.**
+
+`make test` — all tests across `core/` (now: wire, tcs_client, geometry, controller, types, config, bpm, framebuffer, sky, xcor, template, quality, sanity, target_switch, stale, reducer, store) pass.
+
+- [ ] **Step 2: Lint.**
+
+`make lint` — clean.
+
+- [ ] **Step 3: Push and confirm CI.**
+
+```bash
+git log --oneline -10
+git push
+gh run watch
+```
+
+End of Chunk 5. Working state: every per-SUTR computation produces a
+`MeasurementRow` and every batch persists to SQLite. The autoguider can
+now run a complete reduction pipeline against synthetic frames and
+verify the database contents — but file I/O (watchdog), the TCS-talking
+worker thread, and the GUI are still ahead.
+
+---
