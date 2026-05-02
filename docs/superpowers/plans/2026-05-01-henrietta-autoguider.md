@@ -4177,3 +4177,1046 @@ verify the database contents — but file I/O (watchdog), the TCS-talking
 worker thread, and the GUI are still ahead.
 
 ---
+
+## Chunk 6: Runtime integration
+
+**Goal:** Land the file watcher, the worker thread that owns the live
+pipeline, the audio-alert subprocess wrapper, the Monte Carlo "Estimate
+K" tool, and the CLI entry point — plus an integration test suite that
+exercises the whole thing end-to-end against a `FakeArchon` (writes
+synthetic FITS into a tempdir) and `FakeTCS` (`socket.socketpair`).
+
+After this chunk, the autoguider runs from the command line on real or
+synthetic data — only the GUI is missing.
+
+### Task 6.1: Audio dispatcher
+
+**Files:**
+- Create: `henrietta_guider/core/audio.py`
+- Create: `tests/unit/test_audio.py`
+
+Subprocess wrappers around `afplay` (macOS) / `paplay` / `aplay`
+(Linux) for the warning sound, and `say` (macOS) / `espeak` (Linux)
+for the spoken phrase. Non-blocking — the worker spawns the subprocess
+and moves on; if the binary isn't installed, falls back to no-op (and
+logs WARNING once).
+
+Tests use `monkeypatch` to stub `subprocess.Popen` and assert on the
+command line.
+
+- [ ] **Step 1: Failing tests.**
+
+```python
+import sys
+
+import pytest
+
+from henrietta_guider.core import audio
+
+
+@pytest.mark.unit
+class TestAudio:
+    def test_play_sound_uses_afplay_on_macos(self, monkeypatch):
+        calls: list[list[str]] = []
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(audio, "_spawn",
+                            lambda argv: calls.append(list(argv)) or None)
+        ok = audio.play_sound("/System/Library/Sounds/Submarine.aiff")
+        assert ok is True
+        assert calls == [["afplay", "/System/Library/Sounds/Submarine.aiff"]]
+
+    def test_play_sound_uses_paplay_on_linux(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(audio, "_spawn",
+                            lambda argv: calls.append(list(argv)) or None)
+        audio.play_sound("/usr/share/sounds/freedesktop/stereo/bell.oga")
+        assert calls[0][0] in {"paplay", "aplay"}
+
+    def test_speak_uses_say_on_macos(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(audio, "_spawn",
+                            lambda argv: calls.append(list(argv)) or None)
+        audio.speak("target change possible")
+        assert calls == [["say", "target change possible"]]
+
+    def test_speak_uses_espeak_on_linux(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(audio, "_spawn",
+                            lambda argv: calls.append(list(argv)) or None)
+        audio.speak("hello world")
+        assert calls[0][0] == "espeak"
+
+    def test_play_sound_disabled_returns_false_no_call(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(audio, "_spawn",
+                            lambda argv: calls.append(list(argv)) or None)
+        ok = audio.play_sound("/x/y.aiff", enabled=False)
+        assert ok is False
+        assert calls == []
+```
+
+- [ ] **Step 2: Run; confirm fail.**
+
+- [ ] **Step 3: Implement `core/audio.py`.**
+
+```python
+"""Non-blocking audio + speech dispatch for alerts.
+
+Thin wrappers around platform CLIs:
+  macOS  -> afplay / say
+  Linux  -> paplay or aplay (sound) / espeak (speech)
+
+Failures (binary missing, file not found) log WARNING and return
+False; callers may then fall back to Tk's widget.bell(). Audio is
+fire-and-forget: a slow subsystem can never stall the worker thread.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+_warned: set[str] = set()
+
+
+def _spawn(argv: list[str]) -> subprocess.Popen | None:
+    """Production spawn helper; tests monkeypatch this."""
+    try:
+        return subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    except FileNotFoundError as exc:
+        msg = f"audio binary missing: {argv[0]}"
+        if msg not in _warned:
+            log.warning("%s (%s)", msg, exc)
+            _warned.add(msg)
+        return None
+
+
+def play_sound(path: str | Path, enabled: bool = True) -> bool:
+    """Play a sound file. Returns True if a subprocess was spawned."""
+    if not enabled:
+        return False
+    p = str(Path(path).expanduser())
+    if sys.platform == "darwin":
+        argv = ["afplay", p]
+    elif sys.platform.startswith("linux"):
+        binary = "paplay" if shutil.which("paplay") else "aplay"
+        argv = [binary, p]
+    else:
+        log.warning("play_sound: unsupported platform %s", sys.platform)
+        return False
+    proc = _spawn(argv)
+    return proc is not None
+
+
+def speak(phrase: str, enabled: bool = True) -> bool:
+    """Speak a phrase via the OS speech synthesiser."""
+    if not enabled:
+        return False
+    if sys.platform == "darwin":
+        argv = ["say", phrase]
+    elif sys.platform.startswith("linux"):
+        argv = ["espeak", phrase]
+    else:
+        log.warning("speak: unsupported platform %s", sys.platform)
+        return False
+    proc = _spawn(argv)
+    return proc is not None
+```
+
+- [ ] **Step 4: Run; confirm green.**
+
+- [ ] **Step 5: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/core/audio.py tests/unit/test_audio.py
+git commit -m "core: non-blocking audio + speech dispatch"
+```
+
+### Task 6.2: File watcher with settle timer
+
+**Files:**
+- Create: `henrietta_guider/core/watcher.py`
+- Create: `tests/integration/test_watcher.py`
+
+Uses `watchdog` to observe the configured directory. On `on_created` /
+`on_modified` for `.fits` files, schedules a 0.2 s settle timer per
+path; once the timer expires without further events, the file is
+opened with `astropy.io.fits` and (if it parses cleanly) routed by
+filename pattern to one of two queues:
+
+- `henNNNN_sssr.fits` → SUTR queue (`(frame_number, sutr_number, raw_read)`)
+- `henNNNN.fits` → slope-frame queue (`(frame_number, path)` — the
+  worker decides whether to refresh the template)
+
+The watcher exposes both queues + a stop method.
+
+- [ ] **Step 1: Failing integration tests in `tests/integration/test_watcher.py`.**
+
+```python
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+from astropy.io import fits
+
+from henrietta_guider.core.watcher import Watcher
+
+
+def _write_fits(path: Path, ny: int = 64, nx: int = 64,
+                value: float = 50.0) -> None:
+    img = np.full((ny, nx), value, dtype=np.float32)
+    fits.PrimaryHDU(img.astype(np.int16)).writeto(path, overwrite=True)
+
+
+@pytest.mark.integration
+class TestWatcher:
+    def _settle_timeout(self) -> float:
+        return 0.5  # tests don't need to wait for production 0.2 s
+
+    def test_sutr_file_lands_on_sutr_queue(self, tmp_path: Path):
+        with Watcher.start(tmp_path, settle_s=0.05) as w:
+            _write_fits(tmp_path / "hen0042_017r.fits")
+            evt = w.sutr_queue.get(timeout=self._settle_timeout())
+        frame, sutr, arr = evt
+        assert frame == 42
+        assert sutr == 17
+        assert arr.shape == (64, 64)
+
+    def test_slope_file_lands_on_slope_queue(self, tmp_path: Path):
+        with Watcher.start(tmp_path, settle_s=0.05) as w:
+            _write_fits(tmp_path / "hen0042.fits")
+            evt = w.slope_queue.get(timeout=self._settle_timeout())
+        frame, path = evt
+        assert frame == 42
+        assert Path(path).name == "hen0042.fits"
+
+    def test_unmatched_filename_dropped(self, tmp_path: Path):
+        with Watcher.start(tmp_path, settle_s=0.05) as w:
+            _write_fits(tmp_path / "junk.fits")
+            with pytest.raises(Exception):  # queue.Empty
+                w.sutr_queue.get(timeout=0.3)
+
+    def test_stop_unblocks_queue_consumer(self, tmp_path: Path):
+        # Calling stop() should be idempotent and clean up the observer.
+        w = Watcher.start(tmp_path, settle_s=0.05).__enter__()
+        w.stop()
+        # Calling twice must not raise.
+        w.stop()
+```
+
+- [ ] **Step 2: Run; confirm fail.**
+
+- [ ] **Step 3: Implement `core/watcher.py`.**
+
+```python
+"""Filesystem watcher + settle timer + dual-queue routing.
+
+watchdog Observer subscribes to the configured directory. For each
+.fits file event, a 0.2 s settle timer per path is reset; when the
+timer fires, the file is opened with astropy.io.fits and the parsed
+data is pushed onto:
+
+  hen NNNN _sssr .fits   ->  sutr_queue   (frame_number, sutr_number, raw_read)
+  hen NNNN .fits          ->  slope_queue  (frame_number, path)
+
+Anything else is logged at DEBUG and dropped.
+"""
+
+from __future__ import annotations
+
+import logging
+import queue
+import re
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+
+import numpy as np
+from astropy.io import fits
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
+from watchdog.observers import Observer
+
+log = logging.getLogger(__name__)
+
+_SUTR_RE  = re.compile(r"^hen(\d{4})_(\d{3})r\.fits$")
+_SLOPE_RE = re.compile(r"^hen(\d{4})\.fits$")
+
+
+class Watcher:
+    def __init__(self, settle_s: float = 0.2) -> None:
+        self.settle_s = settle_s
+        self.sutr_queue: queue.Queue = queue.Queue()
+        self.slope_queue: queue.Queue = queue.Queue()
+        self._observer: Observer | None = None
+        self._timers: dict[str, threading.Timer] = {}
+        self._lock = threading.Lock()
+
+    @classmethod
+    @contextmanager
+    def start(cls, watch_dir: str | Path, settle_s: float = 0.2):
+        w = cls(settle_s=settle_s)
+        w._start(watch_dir)
+        try:
+            yield w
+        finally:
+            w.stop()
+
+    def _start(self, watch_dir: str | Path) -> None:
+        handler = _Handler(self)
+        obs = Observer()
+        obs.schedule(handler, str(Path(watch_dir).expanduser()),
+                     recursive=False)
+        obs.start()
+        self._observer = obs
+
+    def stop(self) -> None:
+        if self._observer is not None:
+            try:
+                self._observer.stop()
+                self._observer.join(timeout=2.0)
+            finally:
+                self._observer = None
+        with self._lock:
+            for t in list(self._timers.values()):
+                t.cancel()
+            self._timers.clear()
+
+    # Called from the watchdog thread.
+    def _bump_settle(self, path: str) -> None:
+        with self._lock:
+            existing = self._timers.pop(path, None)
+            if existing is not None:
+                existing.cancel()
+            t = threading.Timer(self.settle_s, self._consume, args=(path,))
+            t.daemon = True
+            self._timers[path] = t
+            t.start()
+
+    # Called from the timer thread when settle expires.
+    def _consume(self, path: str) -> None:
+        with self._lock:
+            self._timers.pop(path, None)
+        name = Path(path).name
+
+        m_sutr = _SUTR_RE.match(name)
+        m_slope = _SLOPE_RE.match(name)
+        if not (m_sutr or m_slope):
+            log.debug("watcher: ignored unmatched filename %s", name)
+            return
+
+        try:
+            with fits.open(path) as hdul:
+                data = np.asarray(hdul[0].data, dtype=np.float32)
+        except Exception as exc:
+            log.warning("watcher: failed to open %s: %s", path, exc)
+            return
+
+        if m_sutr:
+            frame = int(m_sutr.group(1))
+            sutr  = int(m_sutr.group(2))
+            self.sutr_queue.put((frame, sutr, data))
+            return
+
+        assert m_slope is not None
+        frame = int(m_slope.group(1))
+        self.slope_queue.put((frame, path))
+
+
+class _Handler(FileSystemEventHandler):
+    def __init__(self, watcher: Watcher) -> None:
+        self.watcher = watcher
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        if event.is_directory or not event.src_path.endswith(".fits"):
+            return
+        self.watcher._bump_settle(event.src_path)
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        if event.is_directory or not event.src_path.endswith(".fits"):
+            return
+        self.watcher._bump_settle(event.src_path)
+```
+
+- [ ] **Step 4: Run; confirm green.**
+
+- [ ] **Step 5: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/core/watcher.py tests/integration/test_watcher.py
+git commit -m "core: file watcher with 0.2s settle timer + dual-queue routing"
+```
+
+### Task 6.3: Monte Carlo (Estimate K)
+
+**Files:**
+- Create: `henrietta_guider/core/monte_carlo.py`
+- Create: `tests/unit/test_monte_carlo.py`
+
+Given an active template, run 50 noisy realisations per `K ∈ {1..5}`,
+push each through the same xcor pipeline used for live guiding, and
+report `RMS(dx_px)` and `RMS(dy_px)` per K. Returns a dataclass the GUI
+or CLI can render.
+
+- [ ] **Step 1: Failing tests (compact).**
+
+```python
+import numpy as np
+import pytest
+
+from henrietta_guider.core.monte_carlo import estimate_k
+from henrietta_guider.core.template import Template
+from henrietta_guider.core.types import Stamp
+
+
+@pytest.mark.unit
+class TestEstimateK:
+    def _template(self, ny=200, nx=51) -> Template:
+        sigma = 1.5
+        x_c = nx // 2
+        x = np.arange(nx)[None, :]
+        img = (1000.0 * np.exp(-((x - x_c) ** 2) / (2 * sigma**2))
+               * np.ones((ny, 1))).astype(np.float32)
+        good = np.ones(img.shape, dtype=bool)
+        return Template(image=img, good=good, frame_number=1,
+                        stamp=Stamp(50, 25, 0, ny))
+
+    def test_returns_a_row_per_k(self):
+        result = estimate_k(self._template(), gain_e_per_dn=4.0,
+                            read_noise_e=12.0, n_realisations=10,
+                            ks=(1, 2, 3))
+        assert [r.K for r in result.rows] == [1, 2, 3]
+        assert all(r.rms_dx_px > 0 for r in result.rows)
+        assert all(r.rms_dy_px > 0 for r in result.rows)
+
+    def test_recommended_k_minimises_total_rms(self):
+        # Synthesised template + n=20 realisations; recommended K is
+        # whichever minimises sqrt(rms_dx^2 + rms_dy^2).
+        result = estimate_k(self._template(), gain_e_per_dn=4.0,
+                            read_noise_e=12.0, n_realisations=20,
+                            ks=(1, 2, 3, 4, 5))
+        totals = [r.rms_dx_px**2 + r.rms_dy_px**2 for r in result.rows]
+        assert result.recommended_K == result.rows[int(np.argmin(totals))].K
+```
+
+- [ ] **Step 2: Run; confirm fail.**
+
+- [ ] **Step 3: Implement `core/monte_carlo.py`.**
+
+```python
+"""Estimate K Monte Carlo simulator (spec §9 Estimate K tool).
+
+For each candidate K, draw n_realisations noisy K-window difference
+images by adding Poisson shot noise + read noise to the template, run
+the same xcor pipeline used for live guiding, and report the RMS of
+the recovered (dx_px, dy_px). Recommends the smallest K that
+minimises the total RMS.
+
+Caller invokes from a short-lived worker thread (spec §9 "Threading
+rules" for Estimate K) so live guiding is unaffected.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from .template import Template
+from .xcor import xcor_2d
+
+
+@dataclass(frozen=True)
+class EstimateKRow:
+    K: int
+    rms_dx_px: float
+    rms_dy_px: float
+
+
+@dataclass(frozen=True)
+class EstimateKResult:
+    rows: list[EstimateKRow]
+    recommended_K: int
+
+
+def estimate_k(
+    template: Template,
+    gain_e_per_dn: float,
+    read_noise_e: float,
+    n_realisations: int = 50,
+    ks: tuple[int, ...] = (1, 2, 3, 4, 5),
+    seed: int | None = None,
+) -> EstimateKResult:
+    rng = np.random.default_rng(seed)
+    rows: list[EstimateKRow] = []
+    for K in ks:
+        dxs: list[float] = []
+        dys: list[float] = []
+        # Per-pixel noise on a K-window difference: Poisson on the
+        # signal in each window + read noise scaled by sqrt(2/K).
+        for _ in range(n_realisations):
+            # Convert template counts to expected electrons; draw Poisson
+            # on each pixel, convert back, add read-noise term.
+            signal_e = np.clip(template.image, 0, None) * gain_e_per_dn
+            noisy_e = rng.poisson(signal_e).astype(np.float32)
+            rn_per_pix = read_noise_e * np.sqrt(2.0 / K)
+            noisy = noisy_e / gain_e_per_dn + rng.normal(
+                0.0, rn_per_pix / gain_e_per_dn, size=template.image.shape,
+            ).astype(np.float32)
+            xc = xcor_2d(noisy, template.image, search=12)
+            dxs.append(xc.dx_px)
+            dys.append(xc.dy_px)
+        rms_dx = float(np.sqrt(np.mean(np.array(dxs) ** 2)))
+        rms_dy = float(np.sqrt(np.mean(np.array(dys) ** 2)))
+        rows.append(EstimateKRow(K=K, rms_dx_px=rms_dx, rms_dy_px=rms_dy))
+
+    totals = [r.rms_dx_px ** 2 + r.rms_dy_px ** 2 for r in rows]
+    best = rows[int(np.argmin(totals))].K
+    return EstimateKResult(rows=rows, recommended_K=best)
+```
+
+- [ ] **Step 4: Run; confirm green.**
+
+- [ ] **Step 5: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/core/monte_carlo.py tests/unit/test_monte_carlo.py
+git commit -m "core: Monte Carlo Estimate K simulator"
+```
+
+### Task 6.4: Worker thread
+
+**Files:**
+- Create: `henrietta_guider/core/worker.py`
+- Create: `tests/integration/fakes.py`
+- Create: `tests/integration/test_worker.py`
+
+The worker is the runtime orchestrator. It owns:
+
+- a `Watcher` (file events → two queues)
+- a `Reducer` (per-SUTR pipeline)
+- a `TCSClient` (wire-protocol sender)
+- a `Store` (SQLite writer)
+- a `StaleFrameWatchdog`, `OutOfFamilyDetector`, `TargetSwitchDetector`
+- the active `Template` (mutable; replaced when `auto_refresh_template`
+  is on or when the user clicks Build Template)
+- the per-axis `Controller` × 2 (RA, Dec)
+
+The main loop:
+
+1. Pull a SUTR event from the queue (with a small timeout).
+2. Run it through the reducer.
+3. For each `MeasurementRow`, push to the store + the GUI event queue.
+4. Compute the science-stamp telescope correction, run through the
+   controllers, send via the TCS client (or note suppression).
+5. Update the watchdog timer.
+6. Also check the slope-frame queue: refresh the template when
+   appropriate.
+
+Tests use `FakeArchon` (writes synthetic `henNNNN_sssr.fits` +
+`henNNNN.fits` into a tempdir) and `FakeTCS` (`socket.socketpair`).
+
+- [ ] **Step 1: Build `tests/integration/fakes.py`.**
+
+```python
+"""Fakes for integration tests."""
+
+from __future__ import annotations
+
+import socket
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from astropy.io import fits
+
+
+def write_fits(path: Path, data: np.ndarray) -> None:
+    fits.PrimaryHDU(data.astype(np.int16)).writeto(path, overwrite=True)
+
+
+@dataclass
+class FakeArchon:
+    """Writes synthetic henNNNN_sssr.fits + henNNNN.fits frames into a
+    tempdir at a configurable cadence. Drives the watcher via filesystem
+    events; no atomic rename (per William's preliminary answer)."""
+    out_dir: Path
+    ny: int = 256
+    nx: int = 256
+
+    def write_sutr(self, frame: int, sutr: int, value: float = 50.0) -> Path:
+        p = self.out_dir / f"hen{frame:04d}_{sutr:03d}r.fits"
+        write_fits(p, np.full((self.ny, self.nx), value, dtype=np.float32))
+        return p
+
+    def write_slope(self, frame: int, value: float = 200.0) -> Path:
+        p = self.out_dir / f"hen{frame:04d}.fits"
+        write_fits(p, np.full((self.ny, self.nx), value, dtype=np.float32))
+        return p
+
+
+@dataclass
+class FakeTCS:
+    """A pair of sockets; the autoguider talks to one end, the test
+    inspects the other."""
+    side_autoguider: socket.socket
+    side_test: socket.socket
+
+    @classmethod
+    def make(cls) -> "FakeTCS":
+        a, b = socket.socketpair()
+        return cls(side_autoguider=a, side_test=b)
+
+    def recv_frame(self, timeout_s: float = 1.0) -> bytes:
+        self.side_test.settimeout(timeout_s)
+        return self.side_test.recv(6)
+
+    def close(self) -> None:
+        self.side_autoguider.close()
+        self.side_test.close()
+```
+
+- [ ] **Step 2: Failing integration tests in `tests/integration/test_worker.py`.**
+
+```python
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from henrietta_guider.core.config import Config
+from henrietta_guider.core.types import Stamp
+from henrietta_guider.core.worker import Worker
+
+from tests.integration.fakes import FakeArchon, FakeTCS
+
+
+@pytest.mark.integration
+class TestWorkerEndToEnd:
+    def _stamp(self, ny: int = 256, nx: int = 256) -> Stamp:
+        return Stamp(x_center=nx // 2, x_halfwidth=20,
+                     y_lo=20, y_hi=ny - 20)
+
+    def test_sutr_files_produce_sqlite_rows(self, tmp_path: Path):
+        cfg = Config()
+        cfg.files.sqlite_db = str(tmp_path / "g.db")
+        cfg.detector.y_middle_row = 128
+        archon = FakeArchon(out_dir=tmp_path)
+        tcs = FakeTCS.make()
+        good = np.ones((archon.ny, archon.nx), dtype=bool)
+        with Worker.run(
+            cfg=cfg, watch_dir=tmp_path, science_stamp=self._stamp(),
+            bpm_good=good, tcs_socket=tcs.side_autoguider,
+            settle_s=0.05,
+        ) as w:
+            # Send a slope file first to seed the template.
+            archon.write_slope(42, value=200.0)
+            time.sleep(0.3)  # let watcher settle and template build.
+            # Then a sequence of SUTRs.
+            archon.write_sutr(43, 1, value=50.0)
+            archon.write_sutr(43, 2, value=51.0)
+            archon.write_sutr(43, 3, value=52.0)
+            time.sleep(0.6)
+        # Verify rows landed.
+        import sqlite3
+        with sqlite3.connect(cfg.files.sqlite_db) as conn:
+            rows = conn.execute(
+                "SELECT frame_number, sutr_number FROM frames ORDER BY 1, 2"
+            ).fetchall()
+        assert (43, 1) in rows
+        assert (43, 2) in rows
+        tcs.close()
+
+    def test_g_command_sent_when_drift_exceeds_deadband(self, tmp_path: Path):
+        # Set up so the synthetic SUTRs imply a non-trivial dx, which
+        # produces a controller command above the deadband.
+        cfg = Config()
+        cfg.files.sqlite_db = str(tmp_path / "g.db")
+        cfg.loop.Kp_ra = 1.0
+        cfg.loop.deadband_arcsec = 0.001
+        cfg.loop.pacing_interval_s = 0.0
+        archon = FakeArchon(out_dir=tmp_path)
+        tcs = FakeTCS.make()
+        good = np.ones((archon.ny, archon.nx), dtype=bool)
+        with Worker.run(
+            cfg=cfg, watch_dir=tmp_path, science_stamp=self._stamp(),
+            bpm_good=good, tcs_socket=tcs.side_autoguider, settle_s=0.05,
+        ) as w:
+            archon.write_slope(42, value=200.0)
+            time.sleep(0.3)
+            archon.write_sutr(43, 1, value=50.0)
+            archon.write_sutr(43, 2, value=80.0)  # larger jump
+            try:
+                frame = tcs.recv_frame(timeout_s=2.0)
+                assert frame[:1] == b"G"
+                assert frame[5:6] == b"\r"
+            finally:
+                tcs.close()
+```
+
+- [ ] **Step 3: Run; confirm fail.**
+
+- [ ] **Step 4: Implement `core/worker.py`.**
+
+```python
+"""Worker thread: owns the live pipeline.
+
+  Watcher  ->  sutr_queue / slope_queue
+                 |
+                 v
+              Reducer  -> MeasurementRow  -> Store + GUI event queue
+                 |
+                 v
+            Controllers (RA, Dec)
+                 |
+                 v
+              TCSClient -> wire frames
+
+Plus quality monitor, target-switch detector, stale-frame watchdog,
+template manager. Single thread; the GUI consumes from
+`measurement_events` via root.after().
+"""
+
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+from .bpm import load_bpm  # used by callers to build bpm_good
+from .config import Config
+from .controller import Controller, ControllerConfig
+from .geometry import detector_to_sky
+from .quality import OutOfFamilyDetector
+from .reducer import Reducer
+from .stale import StaleFrameWatchdog
+from .store import FrameRecord, Store
+from .target_switch import TargetSwitchDetector
+from .tcs_client import TCSClient
+from .template import build_template
+from .types import GuidingState, MeasurementRow, Stamp
+from .watcher import Watcher
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class WorkerEvent:
+    """Pushed onto Worker.measurement_events for the GUI to consume."""
+    rows: list[MeasurementRow]
+    state: GuidingState
+
+
+class Worker:
+    def __init__(
+        self,
+        cfg: Config,
+        watcher: Watcher,
+        reducer: Reducer,
+        tcs: TCSClient,
+        store: Store,
+        science_stamp: Stamp,
+        bpm_good: np.ndarray,
+    ) -> None:
+        self.cfg = cfg
+        self.watcher = watcher
+        self.reducer = reducer
+        self.tcs = tcs
+        self.store = store
+        self.science_stamp = science_stamp
+        self.bpm_good = bpm_good
+
+        self.controllers = (
+            Controller(ControllerConfig(
+                Kp=cfg.loop.Kp_ra, Ki=cfg.loop.Ki_ra, Kd=cfg.loop.Kd_ra,
+                deadband_arcsec=cfg.loop.deadband_arcsec,
+                max_command_arcsec=cfg.loop.max_command_arcsec,
+            )),
+            Controller(ControllerConfig(
+                Kp=cfg.loop.Kp_dec, Ki=cfg.loop.Ki_dec, Kd=cfg.loop.Kd_dec,
+                deadband_arcsec=cfg.loop.deadband_arcsec,
+                max_command_arcsec=cfg.loop.max_command_arcsec,
+            )),
+        )
+        self.quality = OutOfFamilyDetector(
+            window=cfg.quality.out_of_family_window,
+            warmup=cfg.quality.out_of_family_warmup_n,
+            sigma_threshold=cfg.quality.out_of_family_sigma,
+            auto_resume_in_family=cfg.quality.auto_resume_in_family,
+        )
+        self.stale = StaleFrameWatchdog(timeout_s=cfg.quality.stale_frame_timeout_s)
+        self.target_switch = TargetSwitchDetector(
+            threshold_arcsec=cfg.quality.target_switch_arcsec_threshold,
+        )
+        self.measurement_events: queue.Queue[WorkerEvent] = queue.Queue()
+        self._template = None  # set by Build Template flow
+        self._state = GuidingState.IDLE
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @classmethod
+    @contextmanager
+    def run(
+        cls,
+        cfg: Config,
+        watch_dir: str | Path,
+        science_stamp: Stamp,
+        bpm_good: np.ndarray,
+        tcs_socket,
+        settle_s: float = 0.2,
+    ):
+        """Convenience constructor for tests + CLI: builds and starts
+        all the pieces, yields the worker, then cleans up on exit."""
+        watcher = Watcher(settle_s=settle_s)
+        watcher._start(watch_dir)
+        reducer = Reducer(
+            K=cfg.reduction.K, stride=cfg.reduction.stride,
+            gain_e_per_dn=cfg.detector.gain_e_per_dn,
+            bpm_good=bpm_good,
+            xcor_search=cfg.reduction.xcor_search_radius_px,
+        )
+        tcs = TCSClient.from_connected_socket(
+            tcs_socket, pacing_interval_s=cfg.loop.pacing_interval_s,
+        )
+        with Store.open(cfg.files.sqlite_db) as store:
+            w = cls(cfg=cfg, watcher=watcher, reducer=reducer,
+                    tcs=tcs, store=store,
+                    science_stamp=science_stamp, bpm_good=bpm_good)
+            w._start_loop()
+            try:
+                yield w
+            finally:
+                w.stop()
+                watcher.stop()
+
+    def _start_loop(self) -> None:
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            # Drain the slope queue first (cheaper, only updates the
+            # template).
+            try:
+                while True:
+                    frame, path = self.watcher.slope_queue.get_nowait()
+                    self._maybe_refresh_template(frame, path)
+            except queue.Empty:
+                pass
+
+            # Then process up to one SUTR per loop iteration.
+            try:
+                frame, sutr, raw_read = self.watcher.sutr_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self._template is None:
+                # Drop the SUTR; can't measure without a template yet.
+                continue
+
+            stamps_and_templates = [
+                (self.science_stamp, self._template, 0),
+            ]
+            rows = self.reducer.reduce_sutr(frame, sutr, raw_read,
+                                            stamps_and_templates)
+            if not rows:
+                continue
+
+            self.stale.note_accepted(t_now=time.monotonic())
+
+            sci = rows[0]
+            cmd_ra, cmd_dec, suppressed = self._step_controllers(sci)
+
+            # Persist.
+            frame_rec = FrameRecord(
+                frame_number=frame, sutr_number=sutr,
+                timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%S",
+                                            time.gmtime()),
+                frame_path="",  # filled when watcher passes path through
+                ramp_complete=False,
+                ha_hours=None, dec_deg=None, pa_deg=None, airmass=None,
+                temperature_c=None, focus_position=None,
+                cmd_ra_arcsec=cmd_ra, cmd_dec_arcsec=cmd_dec,
+                cmd_suppressed_by=suppressed,
+                err_ra_arcsec=None, err_dec_arcsec=None,
+                guiding_state=self._state.name,
+            )
+            self.store.write_frame(frame_rec, rows)
+            self.measurement_events.put(WorkerEvent(rows=rows, state=self._state))
+
+    def _step_controllers(
+        self, sci: MeasurementRow,
+    ) -> tuple[float | None, float | None, str | None]:
+        if sci.dx_px is None or sci.dy_px is None:
+            return None, None, None
+        dra, ddec = detector_to_sky(
+            sci.dx_px, sci.dy_px,
+            self.cfg.tcs.plate_scale_arcsec_per_px,
+            self.cfg.tcs.pa_convention_offset_deg,
+            self.cfg.tcs.parity_x, self.cfg.tcs.parity_y,
+        )
+        cmd_ra  = self.controllers[0].step(dra)
+        cmd_dec = self.controllers[1].step(ddec)
+        if cmd_ra == 0.0 and cmd_dec == 0.0:
+            return 0.0, 0.0, "deadband"
+        sent = self.tcs.send_guide(cmd_ra, cmd_dec)
+        suppressed = None
+        if not sent:
+            suppressed = "pacing"  # simplification; real worker tracks
+                                    # disconnect vs pacing distinctly
+        return cmd_ra, cmd_dec, suppressed
+
+    def _maybe_refresh_template(self, frame_number: int, path: str) -> None:
+        if self._template is None or self.cfg.reduction.auto_refresh_template:
+            try:
+                self._template = build_template(
+                    path, self.science_stamp, self.bpm_good,
+                )
+                if self._state is GuidingState.IDLE:
+                    self._state = GuidingState.REFERENCE_SET
+            except Exception as exc:
+                log.warning("template build failed: %s", exc)
+```
+
+- [ ] **Step 5: Run; confirm green.**
+
+- [ ] **Step 6: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/core/worker.py \
+        tests/integration/fakes.py tests/integration/test_worker.py
+git commit -m "core: worker thread end-to-end (watcher -> reducer -> TCS + store)"
+```
+
+### Task 6.5: CLI entry point
+
+**Files:**
+- Create: `henrietta_guider/cli/__main__.py`
+
+A thin argparse wrapper that loads config, opens a real TCP socket to
+the TCS, and runs the worker until SIGINT.
+
+- [ ] **Step 1: Implement `cli/__main__.py`.**
+
+```python
+"""Headless CLI entry point: `henrietta-cli`.
+
+Loads config, opens a TCP connection to the TCS, builds the worker,
+and runs until SIGINT.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import socket
+import sys
+from pathlib import Path
+
+import numpy as np
+
+from henrietta_guider.core.bpm import load_bpm
+from henrietta_guider.core.config import load_config
+from henrietta_guider.core.types import Stamp
+from henrietta_guider.core.worker import Worker
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="henrietta-cli")
+    parser.add_argument("--config", default="~/.config/henrietta_guider/config.toml")
+    parser.add_argument("--watch-dir", required=True)
+    parser.add_argument("--bpm", default=None,
+                        help="Override files.bad_pixel_mask")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    cfg = load_config(args.config)
+
+    bpm_path = Path(args.bpm or cfg.files.bad_pixel_mask).expanduser()
+    bpm_good = load_bpm(bpm_path)
+
+    sci_stamp = Stamp(
+        x_center=cfg.detector.y_middle_row,  # placeholder; real value from session
+        x_halfwidth=cfg.reduction.stamp_x_halfwidth_px,
+        y_lo=cfg.reduction.stamp_y_lo, y_hi=cfg.reduction.stamp_y_hi,
+    )
+
+    sock = socket.create_connection((cfg.tcs.host, cfg.tcs.port), timeout=5.0)
+
+    stop = False
+    def handle_sigint(signum, frame):
+        nonlocal stop
+        stop = True
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    with Worker.run(
+        cfg=cfg, watch_dir=args.watch_dir, science_stamp=sci_stamp,
+        bpm_good=bpm_good, tcs_socket=sock,
+    ) as worker:
+        while not stop:
+            signal.pause()  # blocks until SIGINT
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+- [ ] **Step 2: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/cli/__main__.py
+git commit -m "cli: headless henrietta-cli entry point"
+```
+
+### Task 6.6: End-of-chunk verification
+
+- [ ] **Step 1: Run full unit + integration suites.**
+
+`make test` — all unit tests plus the new integration tests pass.
+
+- [ ] **Step 2: Lint.**
+
+`make lint` — clean.
+
+- [ ] **Step 3: Push and confirm CI.**
+
+```bash
+git log --oneline -10
+git push
+gh run watch
+```
+
+End of Chunk 6. Working state: the autoguider runs from the command
+line. Files in the watched directory are processed end-to-end through
+the reducer + controllers + TCS client + SQLite store. Only the GUI is
+missing for the user-facing experience.
+
+---
