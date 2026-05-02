@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS frames (
     cmd_suppressed_by  TEXT,
     err_ra_arcsec      REAL,
     err_dec_arcsec     REAL,
+    field_rotation_deg REAL,
     guiding_state      TEXT,
     PRIMARY KEY (frame_number, sutr_number)
 );
@@ -90,6 +91,7 @@ class FrameRecord:
     cmd_suppressed_by: str | None
     err_ra_arcsec: float | None
     err_dec_arcsec: float | None
+    field_rotation_deg: float | None
     guiding_state: str
 
 
@@ -118,8 +120,9 @@ class Store:
                 ramp_complete, ha_hours, dec_deg, pa_deg, airmass,
                 temperature_c, focus_position,
                 cmd_ra_arcsec, cmd_dec_arcsec, cmd_suppressed_by,
-                err_ra_arcsec, err_dec_arcsec, guiding_state)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                err_ra_arcsec, err_dec_arcsec, field_rotation_deg,
+                guiding_state)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 frame.frame_number,
                 frame.sutr_number,
@@ -137,6 +140,7 @@ class Store:
                 frame.cmd_suppressed_by,
                 frame.err_ra_arcsec,
                 frame.err_dec_arcsec,
+                frame.field_rotation_deg,
                 frame.guiding_state,
             ),
         )

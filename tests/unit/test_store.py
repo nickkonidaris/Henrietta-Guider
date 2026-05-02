@@ -52,6 +52,7 @@ class TestStore:
             cmd_suppressed_by=None,
             err_ra_arcsec=0.018,
             err_dec_arcsec=0.052,
+            field_rotation_deg=0.0,
             guiding_state="GUIDING",
         )
 
@@ -74,9 +75,13 @@ class TestStore:
             assert cursor.fetchone()[0].lower() == "wal"
 
     def test_write_frame_round_trip(self, tmp_path: Path):
+        from dataclasses import replace
+
         db = tmp_path / "roundtrip.db"
         with Store.open(db) as st:
-            frame = self._frame()
+            # Use a sentinel field_rotation_deg value so the round-trip
+            # check on this column is unambiguous.
+            frame = replace(self._frame(), field_rotation_deg=-0.012)
             row = self._row()
             st.write_frame(frame, [row])
         # Read back via a fresh connection (proves data was committed
@@ -89,6 +94,7 @@ class TestStore:
             assert f_row["timestamp_utc"] == frame.timestamp_utc
             assert f_row["guiding_state"] == "GUIDING"
             assert f_row["ramp_complete"] == 0  # bool False -> int 0
+            assert f_row["field_rotation_deg"] == pytest.approx(-0.012)
             m_row = conn.execute(
                 "SELECT * FROM stamp_measurements "
                 "WHERE frame_number=10 AND sutr_number=5 AND stamp_id=0"
@@ -117,6 +123,7 @@ class TestStore:
                 cmd_suppressed_by="alerted",
                 err_ra_arcsec=None,
                 err_dec_arcsec=None,
+                field_rotation_deg=None,
                 guiding_state="ALERTED",
             )
             st.write_frame(frame, [])
