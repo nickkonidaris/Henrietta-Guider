@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import plotext as plt
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Static
@@ -31,6 +32,11 @@ class EstimateKDialog(ModalScreen):
     estimate_k() on a worker thread and renders the result table +
     RMS-vs-K plot.
     """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("q", "close", "Close"),
+    ]
 
     DEFAULT_CSS = """
     EstimateKDialog { align: center middle; }
@@ -122,3 +128,7 @@ class EstimateKDialog(ModalScreen):
             self.dismiss()
         elif event.button.id == "close":
             self.dismiss()
+
+    def action_close(self) -> None:
+        """Triggered by ESC or `q` — same as the Close button."""
+        self.dismiss()

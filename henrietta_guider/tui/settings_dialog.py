@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Static, TabbedContent, TabPane
@@ -77,6 +78,11 @@ def collect_values(
 class SettingsDialog(ModalScreen):
     """Tabbed modal for editing config. Save persists; restart to apply."""
 
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("q", "close", "Close"),
+    ]
+
     DEFAULT_CSS = """
     SettingsDialog { align: center middle; }
     SettingsDialog Vertical { width: 100; height: 30;
@@ -127,6 +133,10 @@ class SettingsDialog(ModalScreen):
             self._save()
         elif event.button.id == "cancel":
             self.dismiss()
+
+    def action_close(self) -> None:
+        """Triggered by ESC or `q` — same as Cancel (no save)."""
+        self.dismiss()
 
     def _save(self) -> None:
         try:
