@@ -272,6 +272,10 @@ class Worker:
                 guiding_state=self._state.name,
             )
             self.store.write_frame(frame_rec, rows)
+            # Mask known-bad pixels with NaN for the operator's display.
+            # matplotlib's colormap renders NaN with the "bad" color
+            # (transparent), so dead/hot pixels stop drawing the eye.
+            display_image = np.where(self.bpm_good, raw_read, np.nan).astype(np.float32)
             self.measurement_events.put(
                 WorkerEvent(
                     rows=rows,
@@ -280,7 +284,7 @@ class Worker:
                     cmd_dec_arcsec=cmd_dec,
                     cmd_suppressed_by=suppressed,
                     field_rotation_deg=field_rotation_deg,
-                    frame_image=raw_read,
+                    frame_image=display_image,
                 )
             )
 

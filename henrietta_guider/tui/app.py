@@ -339,6 +339,25 @@ class HenriettaApp(App):
         self._control_panel.update_buttons_for_state(self.state)
         # TODO(commissioning): notify worker to (re)build template.
 
+    def action_draw_science(self) -> None:
+        self.notify(
+            "Draw science: drag a rectangle on the image window — not yet "
+            "wired. Needs bidirectional IPC with the matplotlib subprocess.",
+            severity="warning",
+        )
+
+    def action_add_comparison(self) -> None:
+        self.notify(
+            "Add comparison: not yet wired (commissioning follow-up).",
+            severity="warning",
+        )
+
+    def action_add_rotation(self) -> None:
+        self.notify(
+            "Add rotation: not yet wired (commissioning follow-up).",
+            severity="warning",
+        )
+
     def action_estimate_k(self) -> None:
         """Push the Estimate K modal. Uses the worker's active template
         when available; falls back to a synthetic Gaussian-column
