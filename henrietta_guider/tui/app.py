@@ -9,11 +9,12 @@ The matplotlib image side-window lives in tui/image_window.py and runs
 on its own thread (Task 7.2); the TUI does not import matplotlib at
 all (so a textual-only / SSH-only run path stays clean).
 
-TODO(commissioning): The TUI itself does NOT spin up a Worker (no TCP
-listener inside the textual asyncio loop). In production the operator
-runs `henrietta-cli` on the bring-up host (which owns the worker +
-SQLite db) and `henrietta-tui` is a separate read-only front-end. See
-Task 7.8 caveats and the deferral note in the plan.
+By default `henrietta-tui` also starts the autoguider runtime (TCP
+listener + Worker) concurrently in the same process via
+henrietta_guider.runtime.AutoguiderRuntime. Pass --no-server to run
+the TUI as a view-only client (e.g. when another process owns the
+server, or when SSH'ing in to peek at the layout). --demo implies
+--no-server and drives the layout with synthetic events.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import argparse
 import enum
 import logging
 import queue
+from typing import TYPE_CHECKING
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -37,6 +39,9 @@ from henrietta_guider.tui.settings_dialog import SettingsDialog  # noqa: F401
 from henrietta_guider.tui.widgets.alerts import AlertBanner
 from henrietta_guider.tui.widgets.control_panel import ControlPanel
 from henrietta_guider.tui.widgets.timeseries import TimeSeries
+
+if TYPE_CHECKING:
+    from henrietta_guider.runtime import AutoguiderRuntime
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +111,7 @@ class HenriettaApp(App):
         *,
         demo: bool = False,
         config_path: str | None = None,
+        runtime: AutoguiderRuntime | None = None,
     ) -> None:
         super().__init__()
         self.state = GuidingState.IDLE
@@ -114,6 +120,8 @@ class HenriettaApp(App):
         self._latest_rotation: float | None = None
         self._demo = demo
         self._config_path = config_path
+        self._runtime = runtime
+        self._server_status: str | None = None
         self._control_panel = ControlPanel()
         self._alerts = AlertBanner(
             audio_alerts=False,
@@ -148,6 +156,8 @@ class HenriettaApp(App):
             self._start_demo_feed()
 
     def _drain_queue(self) -> None:
+        if self.worker is None and self._runtime is not None:
+            self.worker = self._runtime.worker  # may still be None
         if self.worker is None:
             return
         try:
@@ -298,14 +308,73 @@ def main() -> int:
         default="~/.config/henrietta_guider/config.toml",
     )
     parser.add_argument(
+        "--watch-dir",
+        help="Directory the server should watch (required unless --no-server)",
+    )
+    parser.add_argument(
+        "--bpm",
+        default=None,
+        help="Override files.bad_pixel_mask",
+    )
+    parser.add_argument(
+        "--no-server",
+        action="store_true",
+        help=(
+            "Run TUI only — no listener, no worker. Use when another process is running the server."
+        ),
+    )
+    parser.add_argument(
         "--demo",
         action="store_true",
-        help="Drive the layout with synthetic events (offline smoke).",
+        help="Drive the layout with synthetic events (implies --no-server).",
     )
     args = parser.parse_args()
+
+    # --demo implies --no-server (the demo feed substitutes for the worker).
+    if args.demo:
+        args.no_server = True
+
+    if not args.no_server and not args.watch_dir:
+        parser.error("--watch-dir is required unless --no-server is set")
+
     logging.basicConfig(level=logging.INFO)
-    app = HenriettaApp(demo=args.demo, config_path=args.config)
-    app.run()
+    cfg = load_config(args.config)
+    runtime = None
+    if not args.no_server:
+        # Imports kept inside this branch so the view-only / --demo path
+        # does not pull in numpy / astropy / runtime (per Task 7.8 layering).
+        from pathlib import Path
+
+        from henrietta_guider.core.bpm import load_bpm
+        from henrietta_guider.core.types import Stamp
+        from henrietta_guider.runtime import AutoguiderRuntime
+
+        bpm_path = Path(args.bpm or cfg.files.bad_pixel_mask).expanduser()
+        bpm_good = load_bpm(bpm_path)
+        sci_stamp = Stamp(
+            x_center=cfg.detector.y_middle_row,
+            x_halfwidth=cfg.reduction.stamp_x_halfwidth_px,
+            y_lo=cfg.reduction.stamp_y_lo,
+            y_hi=cfg.reduction.stamp_y_hi,
+        )
+        runtime = AutoguiderRuntime(
+            cfg=cfg,
+            watch_dir=args.watch_dir,
+            science_stamp=sci_stamp,
+            bpm_good=bpm_good,
+            on_status=lambda s: log.info("server: %s", s),
+        )
+        runtime.start()
+    try:
+        app = HenriettaApp(
+            demo=args.demo,
+            runtime=runtime,
+            config_path=args.config,
+        )
+        app.run()
+    finally:
+        if runtime is not None:
+            runtime.stop()
     return 0
 
 
