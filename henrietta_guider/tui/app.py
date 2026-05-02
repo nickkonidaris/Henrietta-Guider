@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.widget import Widget
 from textual.widgets import Footer, Header
 
 from henrietta_guider.core.config import Config, load_config  # noqa: F401
@@ -38,6 +39,7 @@ from henrietta_guider.tui.image_window import ImageWindow
 from henrietta_guider.tui.settings_dialog import SettingsDialog  # noqa: F401
 from henrietta_guider.tui.widgets.alerts import AlertBanner
 from henrietta_guider.tui.widgets.control_panel import ControlPanel
+from henrietta_guider.tui.widgets.snr_histogram import SnrHistogram
 from henrietta_guider.tui.widgets.timeseries import TimeSeries
 
 if TYPE_CHECKING:
@@ -137,16 +139,22 @@ class HenriettaApp(App):
             audio_speak=False,
             audio_sound_path=None,
         )
+        # dx/dy fix to ±2.5 px so the operator sees absolute pixel
+        # motion against the controller's deadband / max-command range,
+        # not autoscaled noise.
         self._timeseries: list[TimeSeries] = [
-            TimeSeries("dx (px)", lambda r: r.dx_px),
-            TimeSeries("dy (px)", lambda r: r.dy_px),
+            TimeSeries("dx (px)", lambda r: r.dx_px, ylim=(-2.5, 2.5)),
+            TimeSeries("dy (px)", lambda r: r.dy_px, ylim=(-2.5, 2.5)),
             TimeSeries("fwhm (px)", lambda r: r.trace_fwhm_x_px),
             TimeSeries("flux (ADU)", lambda r: r.trace_flux_adu),
             TimeSeries("sky bg (ADU)", lambda r: r.sky_background_adu),
             TimeSeries("xcor peak", lambda r: r.xcor_peak_value),
-            TimeSeries("snr √e⁻", lambda r: r.signal_snr),
             TimeSeries("rotation (deg)", lambda r: self._latest_rotation),
         ]
+        self._snr_histogram = SnrHistogram(title="SNR √(e⁻) per pixel")
+        # Stack: time-series + histogram (same widget category for
+        # layout — see compose()).
+        self._stack: list[Widget] = [*self._timeseries, self._snr_histogram]
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -154,7 +162,7 @@ class HenriettaApp(App):
         with Horizontal():
             yield self._control_panel
             with Vertical():
-                yield from self._timeseries
+                yield from self._stack
         yield Footer()
 
     def on_mount(self) -> None:
@@ -187,6 +195,9 @@ class HenriettaApp(App):
         self._latest_rotation = getattr(evt, "field_rotation_deg", None)
         for ts in self._timeseries:
             ts.append(sci)
+        self._snr_histogram.update_values(
+            getattr(evt, "science_pixel_signal_snr", None),
+        )
         self._control_panel.update_readouts(
             sci.dx_px,
             sci.dy_px,
@@ -220,10 +231,13 @@ class HenriettaApp(App):
         import random
         import time
 
+        import numpy as np
+
         from henrietta_guider.core.types import MeasurementRow
         from henrietta_guider.core.worker import WorkerEvent
 
         self._demo_t0 = time.time()
+        rng = np.random.default_rng(0)
 
         def tick():
             t = time.time() - self._demo_t0
@@ -247,10 +261,16 @@ class HenriettaApp(App):
                 template_frame_number=0,
                 quality_flags=(),
             )
+            # Synthesize a plausible per-pixel SNR distribution: most
+            # pixels near sky-noise (small SNR), a tail from the trace.
+            sky = rng.normal(loc=2.0, scale=0.6, size=350).clip(0.1)
+            trace = rng.normal(loc=12.0, scale=2.5, size=50).clip(0.1)
+            snr_sample: tuple[float, ...] = (*sky, *trace)
             evt = WorkerEvent(
                 rows=[sci],
                 state=self.state,
                 field_rotation_deg=0.001 * math.sin(t * 0.2),
+                science_pixel_signal_snr=snr_sample,
             )
             self._on_measurement(evt)
 

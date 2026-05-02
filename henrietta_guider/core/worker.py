@@ -59,6 +59,11 @@ class WorkerEvent:
     cmd_dec_arcsec: float | None = None
     cmd_suppressed_by: str | None = None
     field_rotation_deg: float | None = None
+    # Per-pixel signal SNR sample for the science stamp,
+    # = sqrt((raw_read - reset_read) * gain), positive pixels only.
+    # Populated only when the worker has captured a reset for the
+    # current frame; None otherwise. Not persisted (GUI-only).
+    science_pixel_signal_snr: tuple[float, ...] | None = None
 
 
 class Worker:
@@ -115,6 +120,11 @@ class Worker:
         self._state = GuidingState.IDLE
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Reset-read tracking for per-pixel SNR (mirrors what Reducer
+        # does internally; we keep our own copy so we don't reach into
+        # the reducer's privates).
+        self._reset_read: np.ndarray | None = None
+        self._reset_read_frame: int | None = None
 
     @classmethod
     @contextmanager
@@ -198,6 +208,12 @@ class Worker:
                 # Drop the SUTR; can't measure without a template yet.
                 continue
 
+            # Track the reset-read for per-pixel SNR; first SUTR of a
+            # frame is the reset.
+            if self._reset_read_frame != frame:
+                self._reset_read = raw_read.copy()
+                self._reset_read_frame = frame
+
             stamps_and_templates = [
                 (self.science_stamp, self._template, 0),
             ]
@@ -246,6 +262,10 @@ class Worker:
             # up.
             field_rotation_deg = self._compute_field_rotation(rows)
 
+            # Per-pixel SNR for the science stamp (GUI histogram only;
+            # not persisted). Cheap: ~2k pixels per frame.
+            science_pixel_signal_snr = self._compute_science_per_pixel_snr(raw_read)
+
             # Persist.
             frame_rec = FrameRecord(
                 frame_number=frame,
@@ -276,6 +296,7 @@ class Worker:
                     cmd_dec_arcsec=cmd_dec,
                     cmd_suppressed_by=suppressed,
                     field_rotation_deg=field_rotation_deg,
+                    science_pixel_signal_snr=science_pixel_signal_snr,
                 )
             )
 
@@ -343,6 +364,33 @@ class Worker:
         ddy = rot.dy_px - sci.dy_px
         theta_rad = (ddy * math.cos(phi) - ddx * math.sin(phi)) / d
         return math.degrees(theta_rad)
+
+    def _compute_science_per_pixel_snr(
+        self,
+        raw_read: np.ndarray,
+    ) -> tuple[float, ...] | None:
+        """Per-pixel signal SNR over the science stamp.
+
+        SNR = sqrt((raw_read - reset_read) * gain) on each good pixel
+        with positive integrated signal. Returns None until the worker
+        has captured a reset for the current frame. GUI-only (histogram
+        on the SNR panel); not persisted.
+        """
+        if self._reset_read is None:
+            return None
+        s = self.science_stamp
+        sig_dn = (
+            raw_read[s.y_lo : s.y_hi, s.x_min : s.x_max]
+            - self._reset_read[s.y_lo : s.y_hi, s.x_min : s.x_max]
+        )
+        good = self.bpm_good[s.y_lo : s.y_hi, s.x_min : s.x_max]
+        sig_e = np.where(good, sig_dn, 0.0) * self.cfg.detector.gain_e_per_dn
+        sig_e = np.clip(sig_e, 0.0, None)
+        snr = np.sqrt(sig_e)
+        positive = snr[snr > 0.0]
+        if positive.size == 0:
+            return None
+        return tuple(positive.tolist())
 
     def _enter_stale_alert(self) -> None:
         """State transition for the stale-frame timeout.

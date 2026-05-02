@@ -27,11 +27,13 @@ class TimeSeries(Widget):
         title: str,
         getter: Callable,  # row -> float | None
         buffer: int = 600,
+        ylim: tuple[float, float] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.title = title
         self.getter = getter
+        self.ylim = ylim
         self.buffer: collections.deque[float | None] = collections.deque(maxlen=buffer)
 
     def append(self, row) -> None:
@@ -50,6 +52,8 @@ class TimeSeries(Widget):
         plt.frame(False)
         plt.title(self.title)
         plt.plotsize(self.size.width, self.size.height)
+        if self.ylim is not None:
+            plt.ylim(self.ylim[0], self.ylim[1])
         ys = [(y if y is not None else float("nan")) for y in self.buffer]
         plt.plot(ys)
         return Text.from_ansi(plt.build())
