@@ -45,6 +45,10 @@ class Reducer:
         self._reset_read: np.ndarray | None = None
         self._reset_read_frame: int | None = None
         self._warned: set[str] = set()
+        # Latest K-window guide image emitted by the framebuffer, or
+        # None during warmup. Exposed so the worker can publish it for
+        # the operator's image side-window.
+        self.last_guide_image: np.ndarray | None = None
 
     def reduce_sutr(
         self,
@@ -64,6 +68,7 @@ class Reducer:
 
         # K-window difference (None if buffer not warm yet).
         guide_image = self.framebuffer.add(frame_number, sutr_number, raw_read)
+        self.last_guide_image = guide_image
 
         rows: list[MeasurementRow] = []
         for stamp, template, stamp_id in stamps_and_templates:

@@ -272,10 +272,22 @@ class Worker:
                 guiding_state=self._state.name,
             )
             self.store.write_frame(frame_rec, rows)
+            # Operator display image: prefer the K-window difference
+            # (the framebuffer's guide image — trace stands out, sky
+            # drops away). On the first SUTR of a frame the framebuffer
+            # is still in warmup, so fall back to the raw read so the
+            # operator at least sees the integration starting.
+            display_source = (
+                self.reducer.last_guide_image
+                if self.reducer.last_guide_image is not None
+                else raw_read
+            )
             # Mask known-bad pixels with NaN for the operator's display.
             # matplotlib's colormap renders NaN with the "bad" color
             # (transparent), so dead/hot pixels stop drawing the eye.
-            display_image = np.where(self.bpm_good, raw_read, np.nan).astype(np.float32)
+            display_image = np.where(self.bpm_good, display_source, np.nan).astype(
+                np.float32
+            )
             self.measurement_events.put(
                 WorkerEvent(
                     rows=rows,
