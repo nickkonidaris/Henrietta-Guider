@@ -34,6 +34,16 @@ from textual.widgets import Footer, Header
 from henrietta_guider.core.config import Config, load_config
 from henrietta_guider.core.types import GuidingState
 from henrietta_guider.core.worker import Worker
+from henrietta_guider.tui.command_prompt import (
+    STAMP_COLORS,
+    STAMP_LABELS,
+    CommandHelp,
+    CommandPrompt,
+    ParseError,
+    SetStamp,
+    ShowHelp,
+    parse_command,
+)
 from henrietta_guider.tui.estimate_k_dialog import EstimateKDialog
 from henrietta_guider.tui.image_window import ImageWindow
 from henrietta_guider.tui.settings_dialog import SettingsDialog
@@ -114,6 +124,7 @@ class HenriettaApp(App):
         Binding("c", "change_watch_dir", "Change watch dir"),
         Binding("i", "toggle_image", "Show/hide image window"),
         Binding("question_mark", "help", "Help"),
+        Binding("colon", "command_prompt", "Command (:N x y x y or :?)"),
         # Arrow-key focus navigation (in addition to textual's default
         # Tab / Shift+Tab). Falls through any widget that consumes arrows
         # internally (Input cursor, DataTable selection, etc.).
@@ -171,6 +182,11 @@ class HenriettaApp(App):
         # Stack: time-series + histogram (same widget category for
         # layout — see compose()).
         self._stack: list[Widget] = [*self._timeseries, self._snr_histogram]
+        # Stamp overlays the operator places via `:1 ... :2 ... :3 ...`.
+        # Visualization-only at this stage (the worker's reducer still
+        # uses the science stamp it was constructed with). Mapping
+        # n -> {x_min, y_lo, x_max, y_hi}.
+        self._stamps_by_n: dict[int, dict] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -184,6 +200,10 @@ class HenriettaApp(App):
     def on_mount(self) -> None:
         self.image_window = ImageWindow()
         self.image_window.start()  # spawns matplotlib subprocess; safe on no-display
+        # Replay any stamps that have already been set (won't happen at
+        # boot, but a future flow that loads them from config will fire
+        # before on_mount).
+        self._push_stamps_to_image()
         self.set_interval(self.DRAIN_INTERVAL_S, self._drain_queue)
         if self._demo:
             self._start_demo_feed()
@@ -447,8 +467,51 @@ class HenriettaApp(App):
         pass
 
     def action_help(self) -> None:
-        # TODO: render a help screen with the binding table.
-        pass
+        # The `:?` command opens the same screen with command details;
+        # this binding shortcuts to it without typing a colon first.
+        self.push_screen(CommandHelp())
+
+    def action_command_prompt(self) -> None:
+        """Open the vi-style command prompt; dispatch the parsed result."""
+
+        def on_done(value: str | None) -> None:
+            if value is None:
+                return  # ESC
+            self._handle_command(value)
+
+        self.push_screen(CommandPrompt(), on_done)
+
+    def _handle_command(self, raw: str) -> None:
+        result = parse_command(raw)
+        if isinstance(result, ParseError):
+            self.notify(f"command: {result.message}", severity="warning")
+            return
+        if isinstance(result, ShowHelp):
+            self.push_screen(CommandHelp())
+            return
+        if isinstance(result, SetStamp):
+            self._stamps_by_n[result.n] = {
+                "id": result.n,
+                "x_min": result.x_min,
+                "y_lo": result.y_lo,
+                "x_max": result.x_max,
+                "y_hi": result.y_hi,
+                "color": STAMP_COLORS[result.n],
+                "label": STAMP_LABELS[result.n],
+            }
+            self._push_stamps_to_image()
+            self.notify(
+                f"{STAMP_LABELS[result.n]} stamp set: "
+                f"x∈[{result.x_min},{result.x_max}) "
+                f"y∈[{result.y_lo},{result.y_hi})",
+                severity="information",
+            )
+
+    def _push_stamps_to_image(self) -> None:
+        if self.image_window is None or not self.image_window.available:
+            return
+        stamps = [self._stamps_by_n[n] for n in sorted(self._stamps_by_n)]
+        self.image_window.set_stamps(stamps)
 
     def action_change_watch_dir(self) -> None:
         """Open the textual DirectoryTree picker; on selection, restart

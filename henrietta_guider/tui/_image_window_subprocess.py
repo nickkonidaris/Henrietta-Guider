@@ -1,9 +1,16 @@
 """Image-window subprocess entry point.
 
-Read pickled numpy arrays from stdin (length-framed: 4-byte network-
-order size, then `size` bytes of pickle), update a matplotlib figure
-each tick, exit when the parent closes stdin or the user closes the
-window.
+Read pickled message envelopes from stdin (length-framed: 4-byte
+network-order size, then `size` bytes of pickle), update a matplotlib
+figure each tick, exit when the parent closes stdin or the user closes
+the window.
+
+Message envelope shape (a pickled dict):
+
+    {"type": "image",  "image":  np.ndarray}
+    {"type": "stamps", "stamps": [{"id": int, "x_min": int, "y_lo": int,
+                                    "x_max": int, "y_hi": int,
+                                    "color": str, "label": str}, ...]}
 
 Run as: `python -m henrietta_guider.tui._image_window_subprocess`.
 """
@@ -21,7 +28,7 @@ import threading
 # is only paid when the subprocess actually launches.
 
 _SENTINEL = object()
-_INCOMING: queue.Queue = queue.Queue(maxsize=4)
+_INCOMING: queue.Queue = queue.Queue(maxsize=8)
 
 
 def _reader_thread() -> None:
@@ -56,6 +63,7 @@ def main() -> int:
     import matplotlib
 
     matplotlib.use("TkAgg")
+    import matplotlib.patches as mpatches
     import matplotlib.pyplot as plt
     from astropy.visualization import ZScaleInterval
 
@@ -65,10 +73,52 @@ def main() -> int:
     with contextlib.suppress(Exception):
         fig.canvas.manager.set_window_title("Henrietta — guide image")
 
-    state = {"artist": None}
+    state: dict = {
+        "artist": None,
+        "rect_patches": [],  # list of Rectangle patches we own
+        "label_artists": [],  # list of Text artists we own
+    }
+
+    def _draw_stamps(stamps: list[dict]) -> None:
+        # Remove previous overlays.
+        for p in state["rect_patches"]:
+            with contextlib.suppress(Exception):
+                p.remove()
+        for t in state["label_artists"]:
+            with contextlib.suppress(Exception):
+                t.remove()
+        state["rect_patches"] = []
+        state["label_artists"] = []
+        for s in stamps:
+            x_min = float(s["x_min"])
+            y_lo = float(s["y_lo"])
+            width = float(s["x_max"]) - x_min
+            height = float(s["y_hi"]) - y_lo
+            color = s.get("color", "#FFFFFF")
+            label = s.get("label", str(s.get("id", "")))
+            rect = mpatches.Rectangle(
+                (x_min, y_lo),
+                width,
+                height,
+                ec=color,
+                fc="none",
+                lw=1.5,
+            )
+            ax.add_patch(rect)
+            state["rect_patches"].append(rect)
+            txt = ax.text(
+                x_min,
+                y_lo - 12,
+                label,
+                color=color,
+                fontsize=9,
+                fontweight="bold",
+            )
+            state["label_artists"].append(txt)
 
     def poll() -> None:
-        latest = None
+        latest_image = None
+        latest_stamps = None
         sentinel = False
         while True:
             try:
@@ -77,16 +127,25 @@ def main() -> int:
                 break
             if v is _SENTINEL:
                 sentinel = True
-            else:
-                latest = v
-        if latest is not None:
+                continue
+            if not isinstance(v, dict):
+                continue
+            t = v.get("type")
+            if t == "image":
+                latest_image = v.get("image")
+            elif t == "stamps":
+                latest_stamps = v.get("stamps") or []
+
+        redraw = False
+        if latest_image is not None:
             try:
-                vlo, vhi = zs.get_limits(latest)
+                vlo, vhi = zs.get_limits(latest_image)
             except Exception:
-                vlo, vhi = float(latest.min()), float(latest.max())
+                vlo = float(latest_image.min())
+                vhi = float(latest_image.max())
             if state["artist"] is None:
                 state["artist"] = ax.imshow(
-                    latest,
+                    latest_image,
                     origin="lower",
                     cmap="viridis",
                     vmin=vlo,
@@ -95,8 +154,13 @@ def main() -> int:
                     aspect="auto",
                 )
             else:
-                state["artist"].set_data(latest)
+                state["artist"].set_data(latest_image)
                 state["artist"].set_clim(vmin=vlo, vmax=vhi)
+            redraw = True
+        if latest_stamps is not None:
+            _draw_stamps(latest_stamps)
+            redraw = True
+        if redraw:
             fig.canvas.draw_idle()
         if sentinel:
             with contextlib.suppress(Exception):

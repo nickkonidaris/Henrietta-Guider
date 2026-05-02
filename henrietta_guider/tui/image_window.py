@@ -135,14 +135,25 @@ class ImageWindow:
         Drops the oldest pending pickle when the queue is full.
         Silent no-op when the subprocess is not running.
         """
+        self._send({"type": "image", "image": image})
+
+    def set_stamps(self, stamps: list[dict]) -> None:
+        """Push the current stamp list to the subprocess.
+
+        Each stamp dict carries ``id``, ``x_min``, ``y_lo``, ``x_max``,
+        ``y_hi`` (detector pixels), plus optional ``color`` (hex) and
+        ``label`` (short text). Replaces the previous overlay set.
+        """
+        self._send({"type": "stamps", "stamps": list(stamps)})
+
+    def _send(self, msg: dict) -> None:
         if not self.available:
             return
         try:
-            data = pickle.dumps(image, protocol=pickle.HIGHEST_PROTOCOL)
+            data = pickle.dumps(msg, protocol=pickle.HIGHEST_PROTOCOL)
         except Exception:
             return
         payload = struct.pack("!I", len(data)) + data
-        # Drop the oldest if we're already at capacity, then enqueue.
         try:
             self._outbox.put_nowait(payload)
         except queue.Full:
