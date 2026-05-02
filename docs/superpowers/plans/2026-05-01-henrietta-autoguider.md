@@ -4931,9 +4931,17 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class WorkerEvent:
-    """Pushed onto Worker.measurement_events for the GUI to consume."""
+    """Pushed onto Worker.measurement_events for the GUI to consume.
+
+    Carries the just-computed rows, the current state, and the
+    command-side info (so the GUI can plot commands_sent and surface
+    pacing/disconnect/deadband suppressions).
+    """
     rows: list[MeasurementRow]
     state: GuidingState
+    cmd_ra_arcsec: float | None = None
+    cmd_dec_arcsec: float | None = None
+    cmd_suppressed_by: str | None = None
 
 
 class Worker:
@@ -5477,12 +5485,62 @@ class App:
         # [status bar] / [image panel | control panel] / [time-series stack]
         # Each region is its own module (image_panel, control_panel,
         # timeseries_panel) — built up in tasks 7.2-7.4.
-        self.status = ttk.Label(self.root, text="State: IDLE",
-                                anchor="w", padding=4)
-        self.status.pack(fill="x", side="top")
-        # Placeholder frames; populated by later tasks.
+        self.status_frame = ttk.Frame(self.root)
+        self.status_frame.pack(fill="x", side="top")
+
+        # TCS / Watcher status indicators (small coloured dots + label).
+        # Implementation-tip: tk.Canvas with a 14 px circle is the
+        # cheapest way to draw a dot that updates colour live.
+        self.tcs_dot = tk.Canvas(self.status_frame, width=14, height=14,
+                                 highlightthickness=0)
+        self.tcs_dot.create_oval(2, 2, 12, 12, fill="#999",
+                                 outline="#333", tags=("dot",))
+        self.tcs_dot.pack(side="left", padx=(6, 2))
+        self.tcs_label = ttk.Label(self.status_frame, text="TCS")
+        self.tcs_label.pack(side="left", padx=(0, 12))
+
+        self.watcher_dot = tk.Canvas(self.status_frame, width=14, height=14,
+                                     highlightthickness=0)
+        self.watcher_dot.create_oval(2, 2, 12, 12, fill="#999",
+                                     outline="#333", tags=("dot",))
+        self.watcher_dot.pack(side="left", padx=(0, 2))
+        self.watcher_label = ttk.Label(self.status_frame, text="Watcher")
+        self.watcher_label.pack(side="left", padx=(0, 12))
+
+        self.state_label = ttk.Label(self.status_frame, text="State: IDLE")
+        self.state_label.pack(side="left", padx=(0, 12))
+
+        # Watch-dir display + Change… button.
+        self.watch_dir_label = ttk.Label(self.status_frame,
+                                         text="Watch dir: (not set)")
+        self.watch_dir_label.pack(side="left", padx=(0, 8))
+        self.change_btn = ttk.Button(self.status_frame, text="Change…",
+                                     command=self._on_change_watch_dir)
+        self.change_btn.pack(side="left", padx=(0, 8))
+
+        # Body frame (image | control); time-series at bottom.
         self.body = ttk.Frame(self.root)
         self.body.pack(fill="both", expand=True)
+
+    def _on_change_watch_dir(self) -> None:
+        """Open OS-native folder picker; on selection, restart the
+        watcher and drop the state machine to REFERENCE_PENDING."""
+        from tkinter import filedialog
+        new_dir = filedialog.askdirectory(initialdir=self._initial_watch_dir())
+        if not new_dir:
+            return
+        # Implementation: stop the worker, rebuild it with the new
+        # watch_dir, transition state via UiAction.WATCH_DIR. Spelled
+        # out concretely in Task 7.8.
+
+    def _initial_watch_dir(self) -> str:
+        """Best-guess starting location for the folder picker.
+
+        Priority: session.toml's last-used watch dir (if it exists),
+        then config.files.parent_data_dir, then $HOME.
+        """
+        # See Task 7.8 for the wired-up implementation.
+        return str(Path.home())
 
     def _drain_queue(self) -> None:
         if self.worker is not None:
@@ -5495,7 +5553,32 @@ class App:
         self.root.after(self.DRAIN_INTERVAL_MS, self._drain_queue)
 
     def _on_measurement(self, evt) -> None:
-        # Update plots / readouts. Implemented in task 7.3.
+        """Glue: turn one WorkerEvent into panel + state updates.
+
+        Sketch — Task 7.8 wires this to the actual panel instances.
+
+            sci = evt.rows[0]                       # science stamp row
+            self.timeseries_panel.append(sci, evt.cmd_ra_arcsec,
+                                          evt.cmd_dec_arcsec)
+            self.image_panel.update(
+                evt.guide_image, sci.science_stamp,
+                evt.comparison_stamp, evt.template_thumbnail,
+            )
+            self.control_panel.update_readouts(
+                dx=sci.dx_px, dy=sci.dy_px,
+                fwhm=sci.trace_fwhm_x_px,
+                xcor_peak=sci.xcor_peak_value,
+            )
+            if evt.state is not self.state:
+                self.state = evt.state
+                self.state_label.configure(text=f"State: {self.state.name}")
+                self.control_panel.update_buttons_for_state(self.state)
+                if evt.state is GuidingState.ALERTED:
+                    self.alert_banner.show("alert", "Out of family — "
+                                           "commands suppressed")
+                elif evt.state is GuidingState.GUIDING:
+                    self.alert_banner.hide()
+        """
         pass
 
 
@@ -5662,12 +5745,13 @@ class TimeSeriesPanel:
     BUFFER = 600  # ~1 hour at 6 s cadence
 
     SERIES = (
-        ("dx/dy (px)",        ["dx_px", "dy_px"]),
-        ("FWHM (px)",         ["trace_fwhm_x_px"]),
-        ("flux (ADU)",        ["trace_flux_adu"]),
-        ("sky bg (ADU)",      ["sky_background_adu"]),
-        ("xcor peak",         ["xcor_peak_value"]),
-        ("signal SNR √e⁻",    ["signal_snr"]),
+        ("dx/dy (px)",         ["dx_px", "dy_px"]),
+        ("FWHM (px)",          ["trace_fwhm_x_px"]),
+        ("flux (ADU)",         ["trace_flux_adu"]),
+        ("sky bg (ADU)",       ["sky_background_adu"]),
+        ("xcor peak",          ["xcor_peak_value"]),
+        ("signal SNR √e⁻",     ["signal_snr"]),
+        ("commands (arcsec)",  ["cmd_ra_arcsec", "cmd_dec_arcsec"]),
     )
 
     def __init__(self, parent: tk.Widget) -> None:
@@ -5785,7 +5869,10 @@ class AlertBanner:
         self.label.configure(
             text=message, background=self.COLORS.get(severity, "#888"),
         )
-        self.frame.pack(fill="x", side="top", before=...)  # below status
+        # Construction-order trick: the parent caller packs the status
+        # bar first and the banner frame next, so default top-stacking
+        # places the banner immediately below the status bar.
+        self.frame.pack(fill="x", side="top")
         if sound and self.audio_sound_path:
             from henrietta_guider.core import audio as core_audio
             core_audio.play_sound(self.audio_sound_path,
@@ -5862,8 +5949,20 @@ git commit -m "gui: Estimate K modal dialog"
 `tk.Toplevel` with a `ttk.Notebook` mapping onto the §8 config sections
 (Loop / Quality / Reduction / Files / TCS / Display). Each tab is a
 ttk.Frame holding the relevant numeric / string entry widgets. Save
-calls `core.config.save_config`; the running worker picks up the new
-values on its next loop iteration (config is read on each access).
+calls `core.config.save_config`.
+
+**v1 hot-reload limitation.** The Worker (Chunk 6) snapshots config
+into `self.controllers`, `self.quality`, `self.stale`, etc. in
+`__init__`. Saving in the Settings dialog persists the TOML but does
+**not** apply the new values to a running worker. The user must
+restart the autoguider for loop / quality / pacing / target-switch
+changes to take effect. Display-only changes (`audio_alerts`,
+`audio_alert_sound`, theme) are read live by the GUI on each access
+and do apply immediately. Surface this in the dialog with a small
+banner: "Saved. Restart to apply loop / quality changes." If
+commissioning shows operators want hot-reload, the natural fix is a
+`Worker.reload_config()` method that re-instantiates the dependent
+objects without exiting the loop.
 
 - [ ] **Step 1: Implement (pattern; one tab per config section).**
 
@@ -5933,17 +6032,28 @@ After Chunk 7 lands, the implementation matches the spec end-to-end.
 Operational items deferred for after the first on-sky run (these are
 NOT v1 blockers):
 
-- William's open questions in `Questions-for-William.md` — wire-protocol
-  pacing, settle time, Archon file-write convention confirmation,
-  detector parameters, and FITS-keyword inventory. Each unknown has a
-  placeholder default in `config.toml`; commissioning swaps in real
-  values.
-- Target-switch detection wiring (Chunk 6 deferred). Promote in the
-  first commissioning patch.
-- CLI signal race window.
-- Bigger-than-±2.5″ command splitting.
-- Refresh-template-on-flat slow-shape evolution (the spec's "running
-  average" idea; spec §4 currently single-template).
+- **Settings dialog hot-reload.** Saving from the Settings dialog
+  persists the TOML but does not apply loop/quality/pacing/target-
+  switch changes to a running worker (it snapshots values in
+  `__init__`). User must restart the autoguider. Implementing a
+  `Worker.reload_config()` is the obvious fix when commissioning
+  shows operators want live tuning.
+- **Target-switch detection wiring.** Constructed in the worker but
+  not yet called from `_loop`; needs FITS-header keywords on the
+  watcher's SUTR queue payload. Promote in the first commissioning
+  patch.
+- **CLI signal race window** (`signal.pause()` + `not stop`); swap
+  in `signal.sigwait`.
+- **Bigger-than-±2.5″ command splitting.** Currently the controller
+  clips at `max_command_arcsec`; multi-step splitting is a small
+  controller change for v2.
+- **Running-average template** (spec §4 mentions but defers; v1
+  uses a single most-recent good slope frame).
+- **William's open questions** in `Questions-for-William.md` —
+  wire-protocol pacing, settle time, Archon file-write convention
+  confirmation, detector parameters, and FITS-keyword inventory.
+  Each unknown has a placeholder default in `config.toml`;
+  commissioning swaps in real values.
 
 When the implementer completes Chunk 7, the next steps are:
 
