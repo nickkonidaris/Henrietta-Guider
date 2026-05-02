@@ -183,10 +183,14 @@ class HenriettaApp(App):
 
     def on_mount(self) -> None:
         self.image_window = ImageWindow()
-        self.image_window.start()  # no-op on no-display systems
+        self.image_window.start()  # spawns matplotlib subprocess; safe on no-display
         self.set_interval(self.DRAIN_INTERVAL_S, self._drain_queue)
         if self._demo:
             self._start_demo_feed()
+
+    def on_unmount(self) -> None:
+        if self.image_window is not None:
+            self.image_window.stop()
 
     def _drain_queue(self) -> None:
         if self.worker is None and self._runtime is not None:
@@ -245,10 +249,27 @@ class HenriettaApp(App):
         import random
         import time
 
+        import numpy as np
+
         from henrietta_guider.core.types import MeasurementRow
         from henrietta_guider.core.worker import WorkerEvent
 
         self._demo_t0 = time.time()
+        rng = np.random.default_rng(0)
+
+        def synth_image(t: float) -> np.ndarray:
+            """Synthetic guide frame: noisy sky + a drifting Gaussian
+            column trace. Drift is slow enough to see motion at 1 Hz."""
+            ny, nx = 256, 256
+            cx = nx / 2 + 8.0 * math.sin(t * 0.2)
+            x = np.arange(nx)[None, :].astype(np.float32)
+            sky = rng.normal(loc=200.0, scale=8.0, size=(ny, nx)).astype(np.float32)
+            trace = (
+                1500.0
+                * np.exp(-((x - cx) ** 2) / (2 * 1.6**2))
+                * np.ones((ny, 1), dtype=np.float32)
+            )
+            return sky + trace
 
         def tick():
             t = time.time() - self._demo_t0
@@ -282,6 +303,10 @@ class HenriettaApp(App):
                 field_rotation_deg=0.001 * math.sin(t * 0.2),
             )
             self._on_measurement(evt)
+            # Also push a synthetic guide image to the matplotlib
+            # subprocess so the operator can see motion in --demo mode.
+            if self.image_window is not None and self.image_window.available:
+                self.image_window.push_image(synth_image(t))
 
         self.set_interval(1.0, tick)
 
