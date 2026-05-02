@@ -26,6 +26,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bpm", default=None, help="Override files.bad_pixel_mask")
     args = parser.parse_args(argv)
 
+    if not Path(args.watch_dir).expanduser().is_dir():
+        parser.error(f"--watch-dir does not exist: {args.watch_dir}")
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -46,14 +49,18 @@ def main(argv: list[str] | None = None) -> int:
     # Autoguider acts as TCP server; TCS connects to us. Bind & accept
     # the first incoming connection (full re-listen on disconnect lives
     # in worker.py — Chunk 6 / 6.4).
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind((cfg.tcs.bind_host, cfg.tcs.listen_port))
-    listener.listen(1)
     log = logging.getLogger(__name__)
-    log.info("listening for TCS on %s:%d", cfg.tcs.bind_host, cfg.tcs.listen_port)
-    sock, _peer = listener.accept()
-    log.info("TCS connected from %s", _peer)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((cfg.tcs.bind_host, cfg.tcs.listen_port))
+        listener.listen(1)
+        log.info(
+            "listening for TCS on %s:%d",
+            cfg.tcs.bind_host,
+            cfg.tcs.listen_port,
+        )
+        sock, peer = listener.accept()
+    log.info("TCS connected from %s", peer)
 
     stop = False
 
