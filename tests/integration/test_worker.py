@@ -1,3 +1,4 @@
+import sqlite3
 import time
 from pathlib import Path
 
@@ -22,25 +23,43 @@ class TestWorkerEndToEnd:
         archon = FakeArchon(out_dir=tmp_path)
         tcs = FakeTCS.make()
         good = np.ones((archon.ny, archon.nx), dtype=bool)
+        settle_s = 0.05
+        # Spacing between SUTR writes must exceed settle_s; otherwise the
+        # watcher's per-path settle timers race and the worker can pull
+        # SUTRs out of order, which the Reducer's SanityChecker then
+        # WARN_DISCARDs (a real-system safety check). The sleep here is
+        # not about wall-clock margin — it ensures each settle expires
+        # and queues its file before the next one is created.
+        inter_sutr_gap = settle_s * 2
         with Worker.run(
             cfg=cfg,
             watch_dir=tmp_path,
             science_stamp=self._stamp(),
             bpm_good=good,
             tcs_socket=tcs.side_autoguider,
-            settle_s=0.05,
+            settle_s=settle_s,
         ):
             # Send a slope file first to seed the template.
             archon.write_slope(42)
             time.sleep(0.3)  # let watcher settle and template build.
-            # Then a sequence of SUTRs.
+            # Then a sequence of SUTRs, paced past settle_s.
             archon.write_sutr(43, 1)
+            time.sleep(inter_sutr_gap)
             archon.write_sutr(43, 2)
+            time.sleep(inter_sutr_gap)
             archon.write_sutr(43, 3)
-            time.sleep(0.6)
+            # Poll for both SUTR 1 and SUTR 2 to land rather than relying
+            # on a fixed sleep — keeps the test responsive to slow CI.
+            db_path = cfg.files.sqlite_db
+            for _ in range(20):
+                with sqlite3.connect(db_path) as conn:
+                    rows = conn.execute(
+                        "SELECT frame_number, sutr_number FROM frames ORDER BY 1, 2"
+                    ).fetchall()
+                if (43, 1) in rows and (43, 2) in rows:
+                    break
+                time.sleep(0.1)
         # Verify rows landed.
-        import sqlite3
-
         with sqlite3.connect(cfg.files.sqlite_db) as conn:
             rows = conn.execute(
                 "SELECT frame_number, sutr_number FROM frames ORDER BY 1, 2"
@@ -60,17 +79,22 @@ class TestWorkerEndToEnd:
         archon = FakeArchon(out_dir=tmp_path)
         tcs = FakeTCS.make()
         good = np.ones((archon.ny, archon.nx), dtype=bool)
+        settle_s = 0.05
         with Worker.run(
             cfg=cfg,
             watch_dir=tmp_path,
             science_stamp=self._stamp(),
             bpm_good=good,
             tcs_socket=tcs.side_autoguider,
-            settle_s=0.05,
+            settle_s=settle_s,
         ):
             archon.write_slope(42)
             time.sleep(0.3)
             archon.write_sutr(43, 1)
+            # Pace past settle_s so the watcher queues SUTR 1 before
+            # SUTR 2 lands; without this the per-path settle timers race
+            # and the reducer SanityChecker may discard the second SUTR.
+            time.sleep(settle_s * 2)
             archon.write_sutr(43, 2, x_center=130)  # 2-px shift
             try:
                 frame = tcs.recv_frame(timeout_s=2.0)
