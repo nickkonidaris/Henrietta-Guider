@@ -11,13 +11,15 @@ dependencies = [
     "astropy>=7.0",
     "matplotlib>=3.10",
     "numpy>=2.2",
+    "plotext>=5.2",
     "scipy>=1.14",
+    "textual>=0.80",
     "tomli-w>=1.0",
     "watchdog>=6.0",
 ]
 
 [project.scripts]
-henrietta-gui = "henrietta_guider.gui.app:main"
+henrietta-tui = "henrietta_guider.tui.app:main"
 henrietta-cli = "henrietta_guider.cli.__main__:main"
 
 [dependency-groups]
