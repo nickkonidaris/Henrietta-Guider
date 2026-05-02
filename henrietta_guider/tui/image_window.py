@@ -26,10 +26,12 @@ import contextlib
 import logging
 import os
 import pickle
+import queue
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -53,6 +55,14 @@ class ImageWindow:
     def __init__(self) -> None:
         self._proc: subprocess.Popen | None = None
         self._stderr_file = None  # held open for the subprocess's lifetime
+        # Pickled-frame outbound queue + writer thread. The writer thread
+        # owns the synchronous stdin.write so the textual main thread
+        # never blocks behind a backed-up pipe (~64 KB pipe buffer on
+        # macOS vs. ~16 MB frames). maxsize=2 keeps memory bounded; if
+        # we're behind, drop the oldest pending pickle.
+        self._outbox: queue.Queue[bytes] = queue.Queue(maxsize=2)
+        self._writer_thread: threading.Thread | None = None
+        self._writer_stop = threading.Event()
 
     def start(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -86,6 +96,32 @@ class ImageWindow:
             )
         else:
             log.info("Image window subprocess started: pid=%s", self._proc.pid)
+        self._writer_stop.clear()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            daemon=True,
+            name="image-window-writer",
+        )
+        self._writer_thread.start()
+
+    def _writer_loop(self) -> None:
+        """Drain the outbox and write to subprocess stdin. Runs in a
+        daemon thread so the synchronous pipe write never blocks the
+        textual main loop."""
+        while not self._writer_stop.is_set():
+            try:
+                payload = self._outbox.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if self._proc is None or self._proc.stdin is None or self._proc.poll() is not None:
+                return
+            try:
+                self._proc.stdin.write(payload)
+                self._proc.stdin.flush()
+            except BrokenPipeError, OSError:
+                # User closed the matplotlib window; subsequent pushes
+                # will short-circuit on .available.
+                return
 
     @property
     def available(self) -> bool:
@@ -94,23 +130,35 @@ class ImageWindow:
     def push_image(self, image) -> None:
         """Push the latest guide image to the subprocess.
 
-        Silent no-op when the subprocess is not running. Drops frames
-        on a closed pipe (operator closed the matplotlib window).
+        Non-blocking: pickles on the caller's thread, then hands the
+        bytes off to a writer thread via a small bounded queue.
+        Drops the oldest pending pickle when the queue is full.
+        Silent no-op when the subprocess is not running.
         """
-        if not self.available or self._proc is None or self._proc.stdin is None:
+        if not self.available:
             return
         try:
             data = pickle.dumps(image, protocol=pickle.HIGHEST_PROTOCOL)
-            header = struct.pack("!I", len(data))
-            self._proc.stdin.write(header + data)
-            self._proc.stdin.flush()
-        except BrokenPipeError, OSError:
-            # User closed the matplotlib window; subsequent pushes
-            # will hit the .available check and short-circuit.
-            pass
+        except Exception:
+            return
+        payload = struct.pack("!I", len(data)) + data
+        # Drop the oldest if we're already at capacity, then enqueue.
+        try:
+            self._outbox.put_nowait(payload)
+        except queue.Full:
+            with contextlib.suppress(queue.Empty):
+                self._outbox.get_nowait()
+            with contextlib.suppress(queue.Full):
+                self._outbox.put_nowait(payload)
 
     def stop(self, join_timeout_s: float = 2.0) -> None:
         """Tear down the subprocess. Idempotent."""
+        # Stop the writer thread first so it doesn't race against
+        # closing stdin under it.
+        self._writer_stop.set()
+        if self._writer_thread is not None:
+            self._writer_thread.join(timeout=1.0)
+            self._writer_thread = None
         if self._proc is None:
             return
         with contextlib.suppress(Exception):
