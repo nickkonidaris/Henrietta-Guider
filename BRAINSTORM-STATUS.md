@@ -1,6 +1,38 @@
 # Henrietta-Guider — Brainstorm Status
 
-**Last updated:** 2026-05-01 (post-flight resumption)
+**Last updated:** 2026-05-01 (paused mid-plan for travel)
+
+## ⚠️ Implementation plan in progress
+
+Spec is final. The implementation plan is being written chunk-by-chunk
+with a reviewer pass per chunk. Saved at:
+
+  `docs/superpowers/plans/2026-05-01-henrietta-autoguider.md`
+
+Current state (3419 lines):
+
+- **Chunk 1** ✅ Approved — bootstrap (uv, pyproject, Makefile, CI, README).
+- **Chunk 2** ✅ Approved — wire encoder, TCS client, geometry, controller.
+- **Chunk 3** ✅ Approved — types, config, BPM, framebuffer, sky, xcor, template.
+- **Chunk 4** ⏳ Written, awaiting review — quality, sanity, target_switch, stale.
+- **Chunk 5** Not yet written — reducer (per-SUTR orchestrator) + store
+  (SQLite frames + stamp_measurements).
+- **Chunk 6** Not yet written — worker thread + watcher + CLI + Monte
+  Carlo + audio.
+- **Chunk 7** Not yet written — GUI scaffold + image / control / time-
+  series / dialog panels.
+
+When you resume:
+
+1. Re-dispatch the plan-document-reviewer for Chunk 4 (it just got
+   committed; round 1 review pending).
+2. Apply any fixes; verify with round 2 if issues found.
+3. Continue with Chunks 5, 6, 7 (review per chunk).
+4. After Chunk 7 passes review, the plan is ready for execution via
+   `superpowers:subagent-driven-development` or
+   `superpowers:executing-plans`.
+
+
 
 ## Status: ridge → 2-D xcor rewrite COMPLETE in the spec
 
