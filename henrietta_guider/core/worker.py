@@ -59,6 +59,10 @@ class WorkerEvent:
     cmd_dec_arcsec: float | None = None
     cmd_suppressed_by: str | None = None
     field_rotation_deg: float | None = None
+    # Latest raw SUTR for the image side-window. Not persisted; large
+    # (~16 MB at 2048² float32). The TUI hands it to the matplotlib
+    # subprocess via image_window.push_image(...).
+    frame_image: np.ndarray | None = None
 
 
 class Worker:
@@ -276,6 +280,7 @@ class Worker:
                     cmd_dec_arcsec=cmd_dec,
                     cmd_suppressed_by=suppressed,
                     field_rotation_deg=field_rotation_deg,
+                    frame_image=raw_read,
                 )
             )
 

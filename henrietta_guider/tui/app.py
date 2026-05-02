@@ -234,10 +234,11 @@ class HenriettaApp(App):
                 )
             elif prev is GuidingState.ALERTED:
                 self._alerts.hide()
-        # TODO(7.8 / commissioning): push the latest guide image to
-        # self.image_window.push_image(...). WorkerEvent does not carry
-        # the raw guide image yet — wire that up alongside the
-        # RectangleSelector landing in image_window.py.
+        # Push the latest raw frame to the matplotlib side-window.
+        # No-op when the subprocess isn't running (e.g. user closed it).
+        img = getattr(evt, "frame_image", None)
+        if img is not None and self.image_window is not None and self.image_window.available:
+            self.image_window.push_image(img)
 
     # --- demo feed (offline visual smoke) ------------------------------
 
