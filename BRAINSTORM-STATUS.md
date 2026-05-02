@@ -1,8 +1,38 @@
 # Henrietta-Guider — Brainstorm Status
 
-**Last updated:** 2026-05-01 (paused mid-plan for travel)
+**Last updated:** 2026-05-01 (plan complete; ready for execution handoff)
 
-## ⚠️ Implementation plan in progress
+## ✅ Implementation plan complete
+
+The implementation plan is done. All 7 chunks written, reviewer-approved
+through round 1 (one or two chunks went to round 2 because of
+algorithmically substantive fixes; all approved).
+
+Plan file: `docs/superpowers/plans/2026-05-01-henrietta-autoguider.md`
+(~6080 lines).
+
+| Chunk | Topic | Status |
+|---|---|---|
+| 1 | Bootstrap + tooling | ✅ Approved |
+| 2 | Computational foundation (wire / TCS / geometry / controller) | ✅ Approved (2 rounds) |
+| 3 | Reduction primitives (types / config / BPM / framebuffer / sky / xcor / template) | ✅ Approved |
+| 4 | Run-time monitors (quality / sanity / target_switch / stale) | ✅ Approved |
+| 5 | Reducer + SQLite store | ✅ Approved |
+| 6 | Runtime integration (audio / watcher / monte_carlo / worker / CLI) | ✅ Approved |
+| 7 | GUI (Tk + ttk + matplotlib) | ✅ Approved |
+
+The plan is structured as TDD-style bite-sized tasks (single action per
+step, 2–5 minutes each, ending in a commit). Runtime tests use a
+`FakeArchon` (synthetic FITS into a tempdir) and `FakeTCS`
+(`socket.socketpair`).
+
+Execution path:
+- **Recommended:** invoke `superpowers:subagent-driven-development` —
+  fresh subagent per task, two-stage review.
+- Alternative: `superpowers:executing-plans` if subagents aren't
+  available; batch with checkpoints.
+
+## Original handoff context
 
 Spec is final. The implementation plan is being written chunk-by-chunk
 with a reviewer pass per chunk. Saved at:
