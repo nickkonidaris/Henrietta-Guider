@@ -24,8 +24,10 @@ class TestStamp:
         assert s.shape == (100, 21)  # (ny, 2*halfw + 1)
 
     def test_frozen(self):
+        from dataclasses import FrozenInstanceError
+
         s = Stamp(x_center=0, x_halfwidth=1, y_lo=0, y_hi=1)
-        with pytest.raises(Exception):  # noqa: B017
+        with pytest.raises(FrozenInstanceError):
             s.x_center = 99  # frozen dataclass
 
 
