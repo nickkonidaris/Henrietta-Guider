@@ -2756,10 +2756,6 @@ from henrietta_guider.core.quality import OutOfFamilyDetector
 
 @pytest.mark.unit
 class TestOutOfFamilyDetector:
-    def _seed(self, det: OutOfFamilyDetector, n: int, **metrics):
-        for _ in range(n):
-            det.update(metrics)
-
     def test_no_alert_during_warmup(self):
         det = OutOfFamilyDetector(window=20, warmup=10, sigma_threshold=5.0)
         # Push one obvious outlier on the very first frame: must not alert.
@@ -2878,6 +2874,12 @@ class OutOfFamilyDetector:
                 mad = float(np.median(np.abs(np.array(buf) - med)))
                 sigma = self.MAD_SCALE * mad
                 if sigma == 0.0:
+                    # Degenerate (all buffered values identical): any
+                    # deviation IS an outlier. Real data has scatter
+                    # so this only matters for synthetic tests, but we
+                    # define it cleanly here.
+                    if value != med:
+                        offenders.append(name)
                     continue
                 if abs(value - med) > self.sigma_threshold * sigma:
                     offenders.append(name)
@@ -2885,7 +2887,13 @@ class OutOfFamilyDetector:
         is_in_family = not offenders
 
         # Update buffers with in-family values only (so an outlier does
-        # not poison future medians).
+        # not poison future medians). Note: during warmup `is_in_family`
+        # is True for any value (the outlier check is gated by
+        # warming_up=False), so warmup is "simply being seeded" per
+        # spec §5 — extreme first-frame values WILL enter the buffer.
+        # Acceptable: real data has scatter, and this is the same
+        # behaviour as initialising a Kalman filter from whatever
+        # arrives first.
         if is_in_family:
             for name, value in metrics.items():
                 buf = self._buffers.setdefault(name, collections.deque(maxlen=self.window))
@@ -3146,7 +3154,8 @@ class TestTargetSwitchDetector:
                        object_name="A")
         assert v.severity == "pointing"
         assert v.audible is True
-        assert v.spoken_phrase is not None
+        # Spec §4 specifies the exact spoken text.
+        assert v.spoken_phrase == "target change possible"
         assert v.distance_arcsec == pytest.approx(30.0, abs=0.5)
 
     def test_object_only_change_soft_alert(self):
@@ -3297,8 +3306,8 @@ from henrietta_guider.core.stale import StaleFrameWatchdog
 class TestStaleFrameWatchdog:
     def test_not_stale_before_first_accept(self):
         wd = StaleFrameWatchdog(timeout_s=30.0)
-        # No guide image yet -> never stale, no matter how long since arm().
-        wd.arm(t_now=0.0)
+        # No guide image accepted yet -> never stale, no matter how
+        # long has passed.
         assert wd.is_stale(t_now=120.0) is False
 
     def test_becomes_stale_after_timeout(self):
@@ -3357,11 +3366,6 @@ class StaleFrameWatchdog:
     timeout_s: float = 30.0
     _ever_accepted: bool = False
     _last_tick: float | None = None
-
-    def arm(self, t_now: float) -> None:
-        """Mark the watchdog active without an accept (no-op for is_stale)."""
-        # No-op until the first accept; explicit method for symmetry.
-        self._last_tick = t_now
 
     def note_accepted(self, t_now: float) -> None:
         self._ever_accepted = True
