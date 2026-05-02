@@ -3,14 +3,14 @@ import time
 
 import pytest
 
-from henrietta_guider.core.tcs_client import ConnectionState, TCSClient
+from henrietta_guider.core.autoguider_server import AutoGuiderServer, ConnectionState
 
 
 @pytest.mark.unit
-class TestTCSClient:
+class TestAutoGuiderServer:
     def _make_with_pair(self, pacing_s=0.0):
         a, b = socket.socketpair()
-        client = TCSClient.from_connected_socket(a, pacing_interval_s=pacing_s)
+        client = AutoGuiderServer.from_connected_socket(a, pacing_interval_s=pacing_s)
         return client, b  # b is the test-side "TCS"
 
     def test_initial_state_when_seeded_is_connected(self):

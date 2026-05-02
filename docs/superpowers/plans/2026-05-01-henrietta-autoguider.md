@@ -71,7 +71,7 @@ henrietta_guider/
 │   ├── types.py                  shared dataclasses: Stamp, MeasurementRow, Template, ...
 │   ├── config.py                 dataclass config tree + TOML load/save
 │   ├── wire.py                   G xx yy CR encoder/decoder per Wireformat.md
-│   ├── tcs_client.py             TCP fire-and-forget client + pacing
+│   ├── autoguider_server.py             TCP fire-and-forget client + pacing
 │   ├── geometry.py               detector → sky transform (plate scale + PA + parity)
 │   ├── controller.py             per-axis P (with PI/PID hooks) + deadband + clip
 │   ├── bpm.py                    MEF BPM loader (HDU 0; 1 = good)
@@ -501,7 +501,7 @@ End of Chunk 1. Working state: empty package, passing CI, working `make` targets
 
 **Goal:** Land the four pure-computational modules — wire encoder/decoder, TCS client, detector→sky geometry, and per-axis controller — with comprehensive unit tests. These are foundational and have no I/O dependencies (the TCS client uses a pair of `socket.socketpair`s in tests). Once Chunk 2 is done, the autoguider has the entire "math + bits on the wire" pipeline in working code.
 
-The order matters: **wire** before **tcs_client** (encoder is a pure function the client wraps), then **geometry**, then **controller**. Each module is a single-responsibility file (~150 lines max).
+The order matters: **wire** before **autoguider_server** (encoder is a pure function the client wraps), then **geometry**, then **controller**. Each module is a single-responsibility file (~150 lines max).
 
 ### Task 2.1: Wire encoder + decoder
 
@@ -731,8 +731,8 @@ git commit -m "core: wire format encoder + decoder per Wireformat.md"
 ### Task 2.2: TCS client with pacing
 
 **Files:**
-- Create: `henrietta_guider/core/tcs_client.py`
-- Create: `tests/unit/test_tcs_client.py`
+- Create: `henrietta_guider/core/autoguider_server.py`
+- Create: `tests/unit/test_autoguider_server.py`
 
 The client is fire-and-forget over TCP. It owns its own state machine (`DISCONNECTED → CONNECTING → CONNECTED`), auto-reconnects with exponential backoff, and enforces a minimum interval between sends to respect the TCS's `!guiding_ra && !guiding_dec` gate. `send_guide()` is non-blocking: returns `True` on send, `False` if not currently `CONNECTED` or within the pacing window.
 
@@ -740,7 +740,7 @@ The tests use `socket.socketpair()` so we don't need a real TCP listener; the cl
 
 - [ ] **Step 1: Write the failing tests.**
 
-Create `tests/unit/test_tcs_client.py`:
+Create `tests/unit/test_autoguider_server.py`:
 
 ```python
 import socket
@@ -748,14 +748,14 @@ import time
 
 import pytest
 
-from henrietta_guider.core.tcs_client import TCSClient, ConnectionState
+from henrietta_guider.core.autoguider_server import AutoGuiderServer, ConnectionState
 
 
 @pytest.mark.unit
-class TestTCSClient:
+class TestAutoGuiderServer:
     def _make_with_pair(self, pacing_s=0.0):
         a, b = socket.socketpair()
-        client = TCSClient.from_connected_socket(a, pacing_interval_s=pacing_s)
+        client = AutoGuiderServer.from_connected_socket(a, pacing_interval_s=pacing_s)
         return client, b  # b is the test-side "TCS"
 
     def test_initial_state_when_seeded_is_connected(self):
@@ -808,12 +808,12 @@ class TestTCSClient:
 
 - [ ] **Step 2: Run the tests, confirm they fail.**
 
-Run: `uv run pytest tests/unit/test_tcs_client.py -v`
+Run: `uv run pytest tests/unit/test_autoguider_server.py -v`
 Expected: import error (module doesn't exist).
 
-- [ ] **Step 3: Implement `core/tcs_client.py`.**
+- [ ] **Step 3: Implement `core/autoguider_server.py`.**
 
-Create `henrietta_guider/core/tcs_client.py`:
+Create `henrietta_guider/core/autoguider_server.py`:
 
 ```python
 """Fire-and-forget TCP client for the Henrietta TCS guide port.
@@ -852,7 +852,7 @@ class ConnectionState(enum.Enum):
     CONNECTED = "connected"
 
 
-class TCSClient:
+class AutoGuiderServer:
     """TCP client to the TCS guide port.
 
     The class is *not* thread-safe. The autoguider's worker thread is
@@ -886,7 +886,7 @@ class TCSClient:
         cls,
         sock: socket.socket,
         pacing_interval_s: float = 0.0,
-    ) -> "TCSClient":
+    ) -> "AutoGuiderServer":
         """Test-only: build a client around a pre-connected socket."""
         client = cls(pacing_interval_s=pacing_interval_s)
         client._sock = sock
@@ -965,7 +965,7 @@ Note: full reconnect / exponential-backoff machinery is intentionally deferred t
 
 - [ ] **Step 4: Run the tests, confirm they pass.**
 
-Run: `uv run pytest tests/unit/test_tcs_client.py -v`
+Run: `uv run pytest tests/unit/test_autoguider_server.py -v`
 Expected: all five green.
 
 - [ ] **Step 5: Lint.**
@@ -976,7 +976,7 @@ Expected: clean.
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add henrietta_guider/core/tcs_client.py tests/unit/test_tcs_client.py
+git add henrietta_guider/core/autoguider_server.py tests/unit/test_autoguider_server.py
 git commit -m "core: TCS client with pacing + suppression counters"
 ```
 
@@ -1168,7 +1168,7 @@ git commit -m "core: detector to sky transform (PA + plate scale + parity)"
 - Create: `henrietta_guider/core/controller.py`
 - Create: `tests/unit/test_controller.py`
 
-Per-axis P controller for v1 with `Ki` and `Kd` fields already in the dataclass for forward compatibility. Dead band suppresses noise-floor commands; max-command clip keeps a single send within the wire range. The output is the **command** (signed arcseconds) that the worker hands to `tcs_client.send_guide()`.
+Per-axis P controller for v1 with `Ki` and `Kd` fields already in the dataclass for forward compatibility. Dead band suppresses noise-floor commands; max-command clip keeps a single send within the wire range. The output is the **command** (signed arcseconds) that the worker hands to `autoguider_server.send_guide()`.
 
 The "freeze accumulators while ALERTED" semantics for PI/PID (see §5 of the spec) are stubbed in the dataclass but irrelevant for v1's pure-P. The test fixture exercises the dataclass interface so adding integral/derivative state later doesn't break callers.
 
@@ -1607,7 +1607,7 @@ class TestConfigRoundTrip:
     def test_save_then_load_returns_equal_config(self, tmp_path: Path):
         c = Config()
         c.loop.Kp_ra = 0.42                       # mutate one value
-        c.tcs.host = "tcs.lco.test"               # ... and another
+        c.tcs.bind_host = "127.0.0.1"             # ... and another
         out = tmp_path / "config.toml"
         save_config(c, out)
         c2 = load_config(out)
@@ -1697,8 +1697,9 @@ class FilesConfig:
 
 @dataclass
 class TCSConfig:
-    host: str = "tcs.lco"
-    port: int = 5400
+    # Autoguider acts as TCP server; the TCS connects to us.
+    bind_host: str = "0.0.0.0"
+    listen_port: int = 5400
     plate_scale_arcsec_per_px: float = 0.435
     parity_x: int = +1
     parity_y: int = +1
@@ -2700,7 +2701,7 @@ git commit -m "core: template build from slope-fit henNNNN.fits"
 - [ ] **Step 1: Run the full test suite.**
 
 Run: `make test`
-Expected: all unit tests across `tests/unit/` (wire, tcs_client, geometry, controller, types, config, bpm, framebuffer, sky, xcor, template) pass.
+Expected: all unit tests across `tests/unit/` (wire, autoguider_server, geometry, controller, types, config, bpm, framebuffer, sky, xcor, template) pass.
 
 - [ ] **Step 2: Run lint.**
 
@@ -4156,7 +4157,7 @@ git commit -m "core: SQLite store (frames + stamp_measurements, WAL)"
 
 - [ ] **Step 1: Run full suite.**
 
-`make test` — all tests across `core/` (now: wire, tcs_client, geometry, controller, types, config, bpm, framebuffer, sky, xcor, template, quality, sanity, target_switch, stale, reducer, store) pass.
+`make test` — all tests across `core/` (now: wire, autoguider_server, geometry, controller, types, config, bpm, framebuffer, sky, xcor, template, quality, sanity, target_switch, stale, reducer, store) pass.
 
 - [ ] **Step 2: Lint.**
 
@@ -4717,7 +4718,7 @@ The worker is the runtime orchestrator. It owns:
 
 - a `Watcher` (file events → two queues)
 - a `Reducer` (per-SUTR pipeline)
-- a `TCSClient` (wire-protocol sender)
+- a `AutoGuiderServer` (wire-protocol sender)
 - a `Store` (SQLite writer)
 - a `StaleFrameWatchdog`, `OutOfFamilyDetector`, `TargetSwitchDetector`
 - the active `Template` (mutable; replaced when `auto_refresh_template`
@@ -4893,7 +4894,7 @@ class TestWorkerEndToEnd:
             Controllers (RA, Dec)
                  |
                  v
-              TCSClient -> wire frames
+              AutoGuiderServer -> wire frames
 
 Plus quality monitor, target-switch detector, stale-frame watchdog,
 template manager. Single thread; the GUI consumes from
@@ -4921,7 +4922,7 @@ from .reducer import Reducer
 from .stale import StaleFrameWatchdog
 from .store import FrameRecord, Store
 from .target_switch import TargetSwitchDetector
-from .tcs_client import TCSClient
+from .autoguider_server import AutoGuiderServer
 from .template import build_template
 from .types import GuidingState, MeasurementRow, Stamp
 from .watcher import Watcher
@@ -4950,7 +4951,7 @@ class Worker:
         cfg: Config,
         watcher: Watcher,
         reducer: Reducer,
-        tcs: TCSClient,
+        tcs: AutoGuiderServer,
         store: Store,
         science_stamp: Stamp,
         bpm_good: np.ndarray,
@@ -5003,7 +5004,11 @@ class Worker:
         settle_s: float = 0.2,
     ):
         """Convenience constructor for tests + CLI: builds and starts
-        all the pieces, yields the worker, then cleans up on exit."""
+        all the pieces, yields the worker, then cleans up on exit.
+
+        `tcs_socket` is a test-only or test-fixture-supplied pre-accepted
+        socket. The full bind/listen/accept loop with re-listen on
+        disconnect lives in worker.py proper (Chunk 6 / 6.4)."""
         watcher = Watcher(settle_s=settle_s)
         watcher.start_unmanaged(watch_dir)
         reducer = Reducer(
@@ -5012,7 +5017,7 @@ class Worker:
             bpm_good=bpm_good,
             xcor_search=cfg.reduction.xcor_search_radius_px,
         )
-        tcs = TCSClient.from_connected_socket(
+        tcs = AutoGuiderServer.from_connected_socket(
             tcs_socket, pacing_interval_s=cfg.loop.pacing_interval_s,
         )
         with Store.open(cfg.files.sqlite_db) as store:
@@ -5124,7 +5129,7 @@ class Worker:
             return None, None, None
         if self._state is GuidingState.ALERTED:
             return None, None, "alerted"
-        from .tcs_client import ConnectionState
+        from .autoguider_server import ConnectionState
         if self.tcs.state is not ConnectionState.CONNECTED:
             return None, None, "tcs_disconnected"
         dra, ddec = detector_to_sky(
@@ -5249,7 +5254,14 @@ def main(argv: list[str] | None = None) -> int:
         y_lo=cfg.reduction.stamp_y_lo, y_hi=cfg.reduction.stamp_y_hi,
     )
 
-    sock = socket.create_connection((cfg.tcs.host, cfg.tcs.port), timeout=5.0)
+    # Autoguider acts as TCP server; TCS connects to us. Bind & accept
+    # the first incoming connection (full re-listen on disconnect lives
+    # in worker.py — Chunk 6 / 6.4).
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((cfg.tcs.bind_host, cfg.tcs.listen_port))
+    listener.listen(1)
+    sock, _peer = listener.accept()
 
     stop = False
     def handle_sigint(signum, frame):

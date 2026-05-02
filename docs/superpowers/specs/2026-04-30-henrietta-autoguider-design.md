@@ -53,12 +53,12 @@ note the directories here are notional:
 └──────────────────────────┘                  │ on_created/on_modified
                                               │ + 0.2 s settle timer
                                               ▼
-                                   ┌────────────────────────┐
-                                   │  henrietta_guider/core │
-                                   │   watcher → measure →  │
-                                   │   control → tcs_client │
-                                   │   → store              │
-                                   └──┬─────────────────┬───┘
+                                   ┌──────────────────────────────┐
+                                   │  henrietta_guider/core       │
+                                   │   watcher → measure →        │
+                                   │   control → autoguider_server│
+                                   │   → store                    │
+                                   └──┬───────────────────────┬───┘
                                       │ G xx yy CR      │ rows
                                       ▼                 ▼
                                 ┌──────────┐    ┌──────────────────┐
@@ -102,7 +102,7 @@ henrietta_guider/
 │   │                          2-D xcor against template, sub-pixel peak,
 │   │                          FWHM, flux
 │   ├── controller.py          P (PI/PID hooks), dead band, max clip
-│   ├── tcs_client.py          TCP socket, G-command encoder, pacing
+│   ├── autoguider_server.py    TCP socket, G-command encoder, pacing
 │   ├── store.py               SQLite (frames + stamp_measurements tables)
 │   ├── geometry.py            detector → sky transform (plate scale, PA)
 │   ├── monte_carlo.py         "Estimate K" simulator
@@ -651,8 +651,7 @@ range as a defence in depth.
 
 ### Connection lifecycle
 
-`TCSClient` runs its own state machine: `DISCONNECTED → CONNECTING →
-CONNECTED`, with exponential-backoff auto-reconnect on socket drop.
+`AutoGuiderServer` owns a TCP listening socket. Its state machine is `WAITING_FOR_CLIENT → CONNECTED`; if the TCS drops the connection, the server returns to `WAITING_FOR_CLIENT` and accepts the next incoming connection. There is no outbound `connect()` — the TCS is responsible for initiating the link.
 `send_guide()` is non-blocking; returns False if not currently `CONNECTED` or
 within the pacing window. The GUI surfaces the link state and a "commands
 suppressed" counter.
@@ -998,7 +997,7 @@ stdlib `logging`, two handlers:
 - **Rotating file** at `DEBUG` in `~/.henrietta_guider/logs/`, daily,
   30-day retention.
 
-Format: `2026-04-30T08:14:22.137Z INFO core.tcs_client: G50,99 sent
+Format: `2026-04-30T08:14:22.137Z INFO core.autoguider_server: G50,99 sent
 (RA=+2.50″, Dec=-0.05″)`
 
 What gets logged:
@@ -1019,7 +1018,7 @@ The log is the second source of truth after SQLite for debugging.
 
 ### Unit (`tests/unit/`, fast, no I/O, no GUI)
 
-- `tcs_client.encode_command`: tabular tests including ±2.50″, just-out-of-
+- `autoguider_server.encode_command`: tabular tests including ±2.50″, just-out-of-
   range, sub-step rounding. Round-trip against a Python re-implementation of
   the C++ parser to be sure the two agree on every value. Property test:
   `decode(encode(x)) == round(x / 0.05) * 0.05` for every `x` in

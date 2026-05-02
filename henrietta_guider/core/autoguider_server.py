@@ -1,4 +1,4 @@
-"""Fire-and-forget TCP client for the Henrietta TCS guide port.
+"""Fire-and-forget TCP server for the Henrietta autoguider's TCS guide port. The autoguider acts as the TCP server; the TCS connects to it as a client.
 
 State machine:
     DISCONNECTED -> CONNECTING -> CONNECTED
@@ -34,7 +34,7 @@ class ConnectionState(enum.Enum):
     CONNECTED = "connected"
 
 
-class TCSClient:
+class AutoGuiderServer:
     """TCP client to the TCS guide port.
 
     The class is *not* thread-safe. The autoguider's worker thread is
@@ -68,7 +68,7 @@ class TCSClient:
         cls,
         sock: socket.socket,
         pacing_interval_s: float = 0.0,
-    ) -> TCSClient:
+    ) -> AutoGuiderServer:
         """Test-only: build a client around a pre-connected socket."""
         client = cls(pacing_interval_s=pacing_interval_s)
         client._sock = sock
