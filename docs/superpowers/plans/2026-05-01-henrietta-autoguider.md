@@ -2724,3 +2724,696 @@ from a `henNNNN.fits`, and run a 2-D xcor against it — but no
 orchestration yet.
 
 ---
+
+## Chunk 4: Run-time monitors
+
+**Goal:** Land the four run-time-monitoring modules: out-of-family
+quality stats, sequential-order sanity checks, target-switch detection,
+and the stale-frame watchdog. These all consume `MeasurementRow`-like
+events or per-frame metadata and emit alert events; they do not touch
+files or sockets.
+
+### Task 4.1: Out-of-family quality stats
+
+**Files:**
+- Create: `henrietta_guider/core/quality.py`
+- Create: `tests/unit/test_quality.py`
+
+Maintains running median + MAD over the last `out_of_family_window`
+in-family frames per metric (`trace_flux_adu`, `trace_fwhm_x_px`,
+`sky_background_adu`, `xcor_peak_value`, `dx_px`, `dy_px`). Has a
+warmup phase (`out_of_family_warmup_n` in-family frames) before any
+ALERTED can fire. Auto-resume after `auto_resume_in_family` consecutive
+in-family frames.
+
+- [ ] **Step 1: Failing tests in `tests/unit/test_quality.py`.**
+
+```python
+import pytest
+
+from henrietta_guider.core.quality import OutOfFamilyDetector
+
+
+@pytest.mark.unit
+class TestOutOfFamilyDetector:
+    def _seed(self, det: OutOfFamilyDetector, n: int, **metrics):
+        for _ in range(n):
+            det.update(metrics)
+
+    def test_no_alert_during_warmup(self):
+        det = OutOfFamilyDetector(window=20, warmup=10, sigma_threshold=5.0)
+        # Push one obvious outlier on the very first frame: must not alert.
+        verdict = det.update({"trace_flux_adu": 1e9})
+        assert verdict.alerted is False
+        assert verdict.warming_up is True
+
+    def test_alerts_after_warmup_on_outlier(self):
+        det = OutOfFamilyDetector(window=20, warmup=10, sigma_threshold=5.0)
+        # Seed 10 in-family frames with flux ~ 1e5, FWHM ~ 3.0.
+        for _ in range(10):
+            det.update({"trace_flux_adu": 1.0e5, "trace_fwhm_x_px": 3.0})
+        v = det.update({"trace_flux_adu": 1.0e3, "trace_fwhm_x_px": 3.0})
+        assert v.alerted is True
+        assert "trace_flux_adu" in v.offenders
+
+    def test_auto_resume_after_n_in_family(self):
+        det = OutOfFamilyDetector(window=20, warmup=10, sigma_threshold=5.0,
+                                  auto_resume_in_family=3)
+        for _ in range(10):
+            det.update({"trace_flux_adu": 1.0e5})
+        # An outlier alerts.
+        v = det.update({"trace_flux_adu": 1.0e3})
+        assert v.alerted is True
+        # Three in-family frames — the third resumes.
+        for i in range(2):
+            v = det.update({"trace_flux_adu": 1.0e5})
+            assert v.alerted is False
+            assert v.guiding is False  # still in alerted-pending-resume
+        v = det.update({"trace_flux_adu": 1.0e5})
+        assert v.alerted is False
+        assert v.guiding is True
+
+    def test_multiple_offenders_listed(self):
+        det = OutOfFamilyDetector(window=20, warmup=5, sigma_threshold=5.0)
+        for _ in range(5):
+            det.update({"trace_flux_adu": 1e5, "trace_fwhm_x_px": 3.0,
+                        "sky_background_adu": 60.0})
+        v = det.update({"trace_flux_adu": 1e2,
+                        "trace_fwhm_x_px": 30.0,        # also outlier
+                        "sky_background_adu": 60.0})
+        assert "trace_flux_adu" in v.offenders
+        assert "trace_fwhm_x_px" in v.offenders
+        assert "sky_background_adu" not in v.offenders
+
+    def test_window_evicts_oldest(self):
+        det = OutOfFamilyDetector(window=5, warmup=3, sigma_threshold=5.0)
+        # Push a low-flux baseline.
+        for _ in range(5):
+            det.update({"trace_flux_adu": 100.0})
+        # Then 5 new high-flux frames push out the lows; baseline shifts.
+        for _ in range(5):
+            det.update({"trace_flux_adu": 10000.0})
+        # Now 100.0 is the outlier.
+        v = det.update({"trace_flux_adu": 100.0})
+        assert v.alerted is True
+```
+
+- [ ] **Step 2: Run tests; confirm import-error fail.**
+
+Run: `uv run pytest tests/unit/test_quality.py -v`
+
+- [ ] **Step 3: Implement `core/quality.py`.**
+
+```python
+"""Out-of-family detector: running median + MAD with warmup and auto-resume.
+
+Per spec §5: maintain a rolling window of in-family measurements per
+metric. Once warmup completes, any new measurement deviating from the
+metric's running median by > sigma_threshold * (1.4826 * MAD) flags
+the frame as ALERTED. After auto_resume_in_family consecutive
+in-family frames, state returns to GUIDING.
+
+The detector is metric-agnostic: callers pass any dict of {name: value}.
+Only the metrics present in the dict are checked.
+"""
+
+from __future__ import annotations
+
+import collections
+from dataclasses import dataclass, field
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class OutOfFamilyVerdict:
+    alerted: bool          # True if THIS frame is an outlier
+    warming_up: bool       # True until warmup is satisfied
+    guiding: bool          # True == clean GUIDING state; False == ALERTED or pending-resume
+    offenders: tuple[str, ...]  # which metrics tripped
+
+
+@dataclass
+class OutOfFamilyDetector:
+    window: int = 20
+    warmup: int = 10
+    sigma_threshold: float = 5.0
+    auto_resume_in_family: int = 3
+    _buffers: dict[str, collections.deque[float]] = field(default_factory=dict)
+    _in_family_warmup_count: int = 0
+    _alerted: bool = False
+    _consec_in_family_after_alert: int = 0
+
+    MAD_SCALE: float = 1.4826  # sigma equivalent
+
+    def update(self, metrics: dict[str, float]) -> OutOfFamilyVerdict:
+        warming_up = self._in_family_warmup_count < self.warmup
+        offenders: list[str] = []
+        if not warming_up:
+            for name, value in metrics.items():
+                buf = self._buffers.get(name)
+                if buf is None or len(buf) == 0:
+                    continue
+                med = float(np.median(buf))
+                mad = float(np.median(np.abs(np.array(buf) - med)))
+                sigma = self.MAD_SCALE * mad
+                if sigma == 0.0:
+                    continue
+                if abs(value - med) > self.sigma_threshold * sigma:
+                    offenders.append(name)
+
+        is_in_family = not offenders
+
+        # Update buffers with in-family values only (so an outlier does
+        # not poison future medians).
+        if is_in_family:
+            for name, value in metrics.items():
+                buf = self._buffers.setdefault(name, collections.deque(maxlen=self.window))
+                buf.append(value)
+            if warming_up:
+                self._in_family_warmup_count += 1
+
+        # Alert / resume state machine.
+        alerted_now = bool(offenders)
+        if alerted_now:
+            self._alerted = True
+            self._consec_in_family_after_alert = 0
+            guiding = False
+        elif self._alerted:
+            if is_in_family:
+                self._consec_in_family_after_alert += 1
+                if self._consec_in_family_after_alert >= self.auto_resume_in_family:
+                    self._alerted = False
+                    self._consec_in_family_after_alert = 0
+                    guiding = True
+                else:
+                    guiding = False
+            else:
+                guiding = False
+        else:
+            guiding = not warming_up  # in clean GUIDING after warmup; PRE-warmup is "not alerted, not guiding-confirmed"
+
+        return OutOfFamilyVerdict(
+            alerted=alerted_now,
+            warming_up=warming_up,
+            guiding=guiding,
+            offenders=tuple(offenders),
+        )
+```
+
+- [ ] **Step 4: Run tests; confirm green.**
+
+Run: `uv run pytest tests/unit/test_quality.py -v`
+
+- [ ] **Step 5: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/core/quality.py tests/unit/test_quality.py
+git commit -m "core: out-of-family detector (median + MAD, warmup, auto-resume)"
+```
+
+### Task 4.2: Sequential-order sanity checks
+
+**Files:**
+- Create: `henrietta_guider/core/sanity.py`
+- Create: `tests/unit/test_sanity.py`
+
+Per spec §4 "Sequential-order sanity checks". Three tiers:
+
+- **Skipped SUTR within frame** (sutr > last+1): WARN log, lose one
+  K-window diff, continue.
+- **Out-of-order or repeated SUTR** (sutr ≤ last): WARN + audible +
+  discard the file.
+- **Skipped frame numbers** (gap > 1): INFO log, normal operation.
+- **Backwards or repeated frame_number** (≤ last): WARN + audible +
+  discard.
+
+The module returns a `SanityVerdict` describing the action; the worker
+acts on it (drops the file, emits an alert event, etc.).
+
+- [ ] **Step 1: Failing tests.**
+
+```python
+import pytest
+
+from henrietta_guider.core.sanity import (
+    SanityChecker,
+    SanityAction,
+)
+
+
+@pytest.mark.unit
+class TestSanityChecker:
+    def test_first_ever_file_accepted(self):
+        ck = SanityChecker()
+        v = ck.check(frame_number=1, sutr_number=1)
+        assert v.action is SanityAction.ACCEPT
+
+    def test_normal_sequence_accepted(self):
+        ck = SanityChecker()
+        for sutr in range(1, 5):
+            v = ck.check(frame_number=10, sutr_number=sutr)
+            assert v.action is SanityAction.ACCEPT
+
+    def test_skipped_sutr_within_frame_warns_but_accepts(self):
+        ck = SanityChecker()
+        ck.check(10, 1); ck.check(10, 2); ck.check(10, 3)
+        v = ck.check(10, 5)  # skipped 4
+        assert v.action is SanityAction.WARN_ACCEPT
+        assert "sutr_skip" in v.tags
+        assert v.audible is False
+
+    def test_out_of_order_sutr_warns_and_discards(self):
+        ck = SanityChecker()
+        ck.check(10, 1); ck.check(10, 2); ck.check(10, 5)
+        v = ck.check(10, 3)
+        assert v.action is SanityAction.WARN_DISCARD
+        assert "sutr_out_of_order" in v.tags
+        assert v.audible is True
+
+    def test_repeated_sutr_warns_and_discards(self):
+        ck = SanityChecker()
+        ck.check(10, 1); ck.check(10, 2)
+        v = ck.check(10, 2)
+        assert v.action is SanityAction.WARN_DISCARD
+        assert "sutr_out_of_order" in v.tags
+        assert v.audible is True
+
+    def test_skipped_frame_numbers_logged_at_info_level(self):
+        ck = SanityChecker()
+        ck.check(10, 1)
+        v = ck.check(15, 1)  # 5 frames skipped — normal operation
+        assert v.action is SanityAction.ACCEPT
+        assert "frame_skip" in v.tags
+        assert v.audible is False
+
+    def test_backwards_frame_warns_and_discards(self):
+        ck = SanityChecker()
+        ck.check(15, 1)
+        v = ck.check(10, 1)
+        assert v.action is SanityAction.WARN_DISCARD
+        assert "frame_backwards" in v.tags
+        assert v.audible is True
+```
+
+- [ ] **Step 2: Run; confirm fail.**
+
+- [ ] **Step 3: Implement `core/sanity.py`.**
+
+```python
+"""Sequential-order sanity checks for incoming SUTR / slope-frame events.
+
+See spec §4 "Sequential-order sanity checks". Returns a SanityVerdict;
+the worker acts on it.
+"""
+
+from __future__ import annotations
+
+import enum
+from dataclasses import dataclass, field
+
+
+class SanityAction(enum.Enum):
+    ACCEPT       = "accept"
+    WARN_ACCEPT  = "warn_accept"      # log WARN, accept the file
+    WARN_DISCARD = "warn_discard"     # log WARN + audible alert, discard
+
+
+@dataclass(frozen=True)
+class SanityVerdict:
+    action: SanityAction
+    audible: bool          # True if the GUI should play the warning sound
+    tags: tuple[str, ...]  # for log message + quality_flags
+
+
+@dataclass
+class SanityChecker:
+    last_frame: int | None = None
+    last_sutr: int | None = None
+
+    def check(self, frame_number: int, sutr_number: int) -> SanityVerdict:
+        # Across frames first, since a new frame resets per-frame state.
+        if self.last_frame is not None and frame_number <= self.last_frame:
+            return SanityVerdict(SanityAction.WARN_DISCARD, True, ("frame_backwards",))
+
+        tags: list[str] = []
+        if self.last_frame is not None and frame_number > self.last_frame + 1:
+            # Skipped frame numbers — normal operationally (operator
+            # aborted exposures); log at INFO via a tag the caller maps.
+            tags.append("frame_skip")
+
+        new_frame = self.last_frame is None or frame_number != self.last_frame
+        if new_frame:
+            # Reset per-frame SUTR tracker; sutr should be 1 normally
+            # but we're tolerant of any value at frame boundary.
+            self.last_frame = frame_number
+            self.last_sutr  = sutr_number
+            return SanityVerdict(SanityAction.ACCEPT, False, tuple(tags))
+
+        # Within the same frame: enforce monotonicity.
+        assert self.last_sutr is not None
+        if sutr_number <= self.last_sutr:
+            return SanityVerdict(
+                SanityAction.WARN_DISCARD, True, (*tags, "sutr_out_of_order"),
+            )
+        if sutr_number > self.last_sutr + 1:
+            self.last_sutr = sutr_number
+            return SanityVerdict(
+                SanityAction.WARN_ACCEPT, False, (*tags, "sutr_skip"),
+            )
+        self.last_sutr = sutr_number
+        return SanityVerdict(SanityAction.ACCEPT, False, tuple(tags))
+```
+
+- [ ] **Step 4: Run; confirm green.**
+
+- [ ] **Step 5: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/core/sanity.py tests/unit/test_sanity.py
+git commit -m "core: sequential-order sanity checks (SUTR + frame_number)"
+```
+
+### Task 4.3: Target-switch detection
+
+**Files:**
+- Create: `henrietta_guider/core/target_switch.py`
+- Create: `tests/unit/test_target_switch.py`
+
+Two-tier severity per spec §4 "Target-switch detection":
+
+- **Pointing jump** (`sky distance > target_switch_arcsec_threshold`):
+  ERROR + spoken phrase + state → REFERENCE_PENDING.
+- **OBJECT-only change** (no pointing jump): WARN + small beep, no
+  state change.
+- **Both** → pointing-jump path wins.
+
+- [ ] **Step 1: Failing tests.**
+
+```python
+import math
+
+import pytest
+
+from henrietta_guider.core.target_switch import (
+    TargetSwitchDetector,
+    TargetSwitchVerdict,
+)
+
+
+@pytest.mark.unit
+class TestTargetSwitchDetector:
+    def test_first_call_no_alert(self):
+        det = TargetSwitchDetector(threshold_arcsec=20.0)
+        v = det.update(ra_deg=10.0, dec_deg=-30.0, object_name="STAR_A")
+        assert v.severity == "none"
+
+    def test_small_drift_no_alert(self):
+        det = TargetSwitchDetector(threshold_arcsec=20.0)
+        det.update(ra_deg=10.0, dec_deg=-30.0, object_name="A")
+        # Move by 5" in RA: well under threshold.
+        v = det.update(ra_deg=10.0 + 5.0/3600.0/math.cos(math.radians(-30.0)),
+                       dec_deg=-30.0, object_name="A")
+        assert v.severity == "none"
+
+    def test_pointing_jump_full_alert(self):
+        det = TargetSwitchDetector(threshold_arcsec=20.0)
+        det.update(ra_deg=10.0, dec_deg=-30.0, object_name="A")
+        # Move by 30" in Dec.
+        v = det.update(ra_deg=10.0, dec_deg=-30.0 + 30.0/3600.0,
+                       object_name="A")
+        assert v.severity == "pointing"
+        assert v.audible is True
+        assert v.spoken_phrase is not None
+        assert v.distance_arcsec == pytest.approx(30.0, abs=0.5)
+
+    def test_object_only_change_soft_alert(self):
+        det = TargetSwitchDetector(threshold_arcsec=20.0)
+        det.update(ra_deg=10.0, dec_deg=-30.0, object_name="A")
+        v = det.update(ra_deg=10.0, dec_deg=-30.0, object_name="B")
+        assert v.severity == "object_only"
+        assert v.audible is False             # tiny beep handled outside
+        assert v.spoken_phrase is None
+
+    def test_both_signals_pointing_wins(self):
+        det = TargetSwitchDetector(threshold_arcsec=20.0)
+        det.update(ra_deg=10.0, dec_deg=-30.0, object_name="A")
+        v = det.update(ra_deg=10.0, dec_deg=-30.0 + 30.0/3600.0,
+                       object_name="B")
+        assert v.severity == "pointing"
+
+    def test_reset_clears_previous(self):
+        # After reset() the next call should NOT compare against the old
+        # frame (e.g., used after Save Reference clears running state).
+        det = TargetSwitchDetector(threshold_arcsec=20.0)
+        det.update(ra_deg=10.0, dec_deg=-30.0, object_name="A")
+        det.reset()
+        v = det.update(ra_deg=20.0, dec_deg=+45.0, object_name="Z")
+        assert v.severity == "none"
+
+    def test_costheta_correction(self):
+        # At Dec=-60°, dRA in arcsec = dRA_deg * cos(-60°) * 3600.
+        # 30" RA-on-sky at Dec=-60 corresponds to dRA_deg = 30/(0.5*3600).
+        det = TargetSwitchDetector(threshold_arcsec=20.0)
+        det.update(ra_deg=0.0, dec_deg=-60.0, object_name="A")
+        v = det.update(ra_deg=30.0/3600.0/0.5, dec_deg=-60.0,
+                       object_name="A")
+        assert v.severity == "pointing"
+        assert v.distance_arcsec == pytest.approx(30.0, abs=0.5)
+```
+
+- [ ] **Step 2: Run; confirm fail.**
+
+- [ ] **Step 3: Implement `core/target_switch.py`.**
+
+```python
+"""Target-switch detection. Two signals, two severities (spec §4).
+
+Pointing jump (>= threshold arcsec on-sky) -> full alert + spoken phrase
++ caller transitions to REFERENCE_PENDING. OBJECT-only change ->
+soft signal + caller does a small beep. Pointing-jump wins on ties.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class TargetSwitchVerdict:
+    severity: str                   # "none" | "object_only" | "pointing"
+    audible: bool                   # play warning sound (pointing only)
+    spoken_phrase: str | None       # speech text (pointing only)
+    distance_arcsec: float          # 0.0 if no previous frame
+    object_changed: bool
+
+
+@dataclass
+class TargetSwitchDetector:
+    threshold_arcsec: float = 20.0
+    _last_ra_deg: float | None = None
+    _last_dec_deg: float | None = None
+    _last_object: str | None = None
+
+    def reset(self) -> None:
+        self._last_ra_deg = None
+        self._last_dec_deg = None
+        self._last_object = None
+
+    def update(
+        self,
+        ra_deg: float,
+        dec_deg: float,
+        object_name: str,
+    ) -> TargetSwitchVerdict:
+        if self._last_ra_deg is None:
+            self._last_ra_deg = ra_deg
+            self._last_dec_deg = dec_deg
+            self._last_object = object_name
+            return TargetSwitchVerdict("none", False, None, 0.0, False)
+
+        # Compute on-sky distance with cos(Dec) correction on RA.
+        cos_dec = math.cos(math.radians((dec_deg + self._last_dec_deg) / 2.0))
+        d_ra_arc  = (ra_deg - self._last_ra_deg) * cos_dec * 3600.0
+        d_dec_arc = (dec_deg - self._last_dec_deg) * 3600.0
+        dist = math.hypot(d_ra_arc, d_dec_arc)
+
+        object_changed = (object_name != self._last_object)
+
+        # Update before returning (so a subsequent call sees the new state).
+        self._last_ra_deg = ra_deg
+        self._last_dec_deg = dec_deg
+        self._last_object = object_name
+
+        if dist > self.threshold_arcsec:
+            return TargetSwitchVerdict(
+                "pointing", True, "target change possible", dist, object_changed,
+            )
+        if object_changed:
+            return TargetSwitchVerdict(
+                "object_only", False, None, dist, True,
+            )
+        return TargetSwitchVerdict("none", False, None, dist, False)
+```
+
+- [ ] **Step 4: Run; confirm green.**
+
+- [ ] **Step 5: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/core/target_switch.py tests/unit/test_target_switch.py
+git commit -m "core: two-tier target-switch detector (pointing-jump + OBJECT)"
+```
+
+### Task 4.4: Stale-frame watchdog timer
+
+**Files:**
+- Create: `henrietta_guider/core/stale.py`
+- Create: `tests/unit/test_stale.py`
+
+Tracks elapsed seconds since the last accepted guide image. If the
+timeout (default 30 s) is exceeded, emits a "stale" event. Gated:
+doesn't tick until at least one guide image has been accepted; resets
+on watch-dir change and on first accepted guide image after a frame
+boundary.
+
+The module exposes `arm()`, `note_accepted()`, `note_frame_boundary()`,
+`note_watch_dir_changed()`, and `is_stale(now: float) -> bool`. Time
+comes from the caller (so tests don't need real sleeps).
+
+- [ ] **Step 1: Failing tests.**
+
+```python
+import pytest
+
+from henrietta_guider.core.stale import StaleFrameWatchdog
+
+
+@pytest.mark.unit
+class TestStaleFrameWatchdog:
+    def test_not_stale_before_first_accept(self):
+        wd = StaleFrameWatchdog(timeout_s=30.0)
+        # No guide image yet -> never stale, no matter how long since arm().
+        wd.arm(t_now=0.0)
+        assert wd.is_stale(t_now=120.0) is False
+
+    def test_becomes_stale_after_timeout(self):
+        wd = StaleFrameWatchdog(timeout_s=30.0)
+        wd.note_accepted(t_now=10.0)
+        assert wd.is_stale(t_now=39.0) is False
+        assert wd.is_stale(t_now=41.0) is True
+
+    def test_accept_resets_timer(self):
+        wd = StaleFrameWatchdog(timeout_s=30.0)
+        wd.note_accepted(t_now=10.0)
+        wd.note_accepted(t_now=35.0)
+        assert wd.is_stale(t_now=60.0) is False
+        assert wd.is_stale(t_now=66.0) is True  # 35 + 31
+
+    def test_frame_boundary_resets(self):
+        wd = StaleFrameWatchdog(timeout_s=30.0)
+        wd.note_accepted(t_now=10.0)
+        wd.note_frame_boundary(t_now=29.0)
+        # Boundary doesn't itself count as an accept, but resets the
+        # timer so we don't false-trip during the 2K warmup.
+        assert wd.is_stale(t_now=58.0) is False
+        assert wd.is_stale(t_now=60.0) is True
+
+    def test_watch_dir_change_disarms(self):
+        wd = StaleFrameWatchdog(timeout_s=30.0)
+        wd.note_accepted(t_now=10.0)
+        wd.note_watch_dir_changed(t_now=20.0)
+        # After dir change: must wait for a new accept before being stale.
+        assert wd.is_stale(t_now=120.0) is False
+        wd.note_accepted(t_now=130.0)
+        assert wd.is_stale(t_now=161.0) is True
+```
+
+- [ ] **Step 2: Run; confirm fail.**
+
+- [ ] **Step 3: Implement `core/stale.py`.**
+
+```python
+"""Stale-frame watchdog timer. Time is injected by the caller for
+testability; in production use time.monotonic().
+
+Per spec §4 "Stale-frame watchdog": tick is gated on having ever
+accepted a guide image, and resets on watch-dir change and on each
+new frame_number boundary so the inevitable warm-up delay of ~2K reads
+on a new target does not falsely trip the alert.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class StaleFrameWatchdog:
+    timeout_s: float = 30.0
+    _ever_accepted: bool = False
+    _last_tick: float | None = None
+
+    def arm(self, t_now: float) -> None:
+        """Mark the watchdog active without an accept (no-op for is_stale)."""
+        # No-op until the first accept; explicit method for symmetry.
+        self._last_tick = t_now
+
+    def note_accepted(self, t_now: float) -> None:
+        self._ever_accepted = True
+        self._last_tick = t_now
+
+    def note_frame_boundary(self, t_now: float) -> None:
+        # Don't change _ever_accepted; just reset the timer.
+        self._last_tick = t_now
+
+    def note_watch_dir_changed(self, t_now: float) -> None:
+        self._ever_accepted = False
+        self._last_tick = t_now
+
+    def is_stale(self, t_now: float) -> bool:
+        if not self._ever_accepted:
+            return False
+        if self._last_tick is None:
+            return False
+        return (t_now - self._last_tick) > self.timeout_s
+```
+
+- [ ] **Step 4: Run; confirm green.**
+
+- [ ] **Step 5: Lint and commit.**
+
+```bash
+uv run ruff format . && uv run ruff check .
+git add henrietta_guider/core/stale.py tests/unit/test_stale.py
+git commit -m "core: stale-frame watchdog with injected clock"
+```
+
+### Task 4.5: End-of-chunk verification
+
+- [ ] **Step 1: Run full suite.**
+
+`make test` — all unit tests across the eight existing test files plus the four new ones (quality, sanity, target_switch, stale) pass.
+
+- [ ] **Step 2: Lint.**
+
+`make lint` — clean.
+
+- [ ] **Step 3: Push and confirm CI.**
+
+```bash
+git log --oneline -10
+git push
+gh run watch
+```
+
+End of Chunk 4. Working state: every run-time monitor implemented and
+tested in isolation. The autoguider can now detect outliers, sequence
+violations, target switches, and stale-frame conditions — but not yet
+glued into a `MeasurementRow` pipeline.
+
+---
