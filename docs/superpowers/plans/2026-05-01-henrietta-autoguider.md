@@ -4385,12 +4385,14 @@ class TestWatcher:
 
     def test_sutr_file_lands_on_sutr_queue(self, tmp_path: Path):
         with Watcher.start(tmp_path, settle_s=0.05) as w:
-            _write_fits(tmp_path / "hen0042_017r.fits")
+            written = tmp_path / "hen0042_017r.fits"
+            _write_fits(written)
             evt = w.sutr_queue.get(timeout=self._settle_timeout())
-        frame, sutr, arr = evt
+        frame, sutr, arr, path = evt
         assert frame == 42
         assert sutr == 17
         assert arr.shape == (64, 64)
+        assert Path(path) == written
 
     def test_slope_file_lands_on_slope_queue(self, tmp_path: Path):
         with Watcher.start(tmp_path, settle_s=0.05) as w:
@@ -4464,14 +4466,20 @@ class Watcher:
     @classmethod
     @contextmanager
     def start(cls, watch_dir: str | Path, settle_s: float = 0.2):
+        """Context-managed constructor; start_unmanaged + stop manual."""
         w = cls(settle_s=settle_s)
-        w._start(watch_dir)
+        w.start_unmanaged(watch_dir)
         try:
             yield w
         finally:
             w.stop()
 
-    def _start(self, watch_dir: str | Path) -> None:
+    def start_unmanaged(self, watch_dir: str | Path) -> None:
+        """Start the underlying observer without a context manager.
+
+        Public; used by Worker.run which wants to compose its own setup
+        and teardown around the watcher.
+        """
         handler = _Handler(self)
         obs = Observer()
         obs.schedule(handler, str(Path(watch_dir).expanduser()),
@@ -4524,7 +4532,10 @@ class Watcher:
         if m_sutr:
             frame = int(m_sutr.group(1))
             sutr  = int(m_sutr.group(2))
-            self.sutr_queue.put((frame, sutr, data))
+            # Include the path so the worker can persist frame_path and
+            # later read FITS-header keywords (HA / Dec / OBJECT for
+            # target-switch detection) without re-opening from scratch.
+            self.sutr_queue.put((frame, sutr, data, path))
             return
 
         assert m_slope is not None
@@ -4986,7 +4997,7 @@ class Worker:
         """Convenience constructor for tests + CLI: builds and starts
         all the pieces, yields the worker, then cleans up on exit."""
         watcher = Watcher(settle_s=settle_s)
-        watcher._start(watch_dir)
+        watcher.start_unmanaged(watch_dir)
         reducer = Reducer(
             K=cfg.reduction.K, stride=cfg.reduction.stride,
             gain_e_per_dn=cfg.detector.gain_e_per_dn,
@@ -5027,9 +5038,14 @@ class Worker:
             except queue.Empty:
                 pass
 
+            # Stale-frame check fires even when no SUTRs arrive (the
+            # whole point is to alert when the Archon stops producing).
+            if self.stale.is_stale(t_now=time.monotonic()):
+                self._enter_stale_alert()
+
             # Then process up to one SUTR per loop iteration.
             try:
-                frame, sutr, raw_read = self.watcher.sutr_queue.get(timeout=0.1)
+                frame, sutr, raw_read, path = self.watcher.sutr_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -5048,6 +5064,32 @@ class Worker:
             self.stale.note_accepted(t_now=time.monotonic())
 
             sci = rows[0]
+
+            # Quality check on the science stamp's metrics. Only run when
+            # the reducer actually produced xcor/trace fields (i.e. the
+            # framebuffer has warmed up on this frame).
+            if sci.dx_px is not None:
+                verdict = self.quality.update({
+                    "trace_flux_adu":     sci.trace_flux_adu,
+                    "trace_fwhm_x_px":    sci.trace_fwhm_x_px,
+                    "sky_background_adu": sci.sky_background_adu,
+                    "xcor_peak_value":    sci.xcor_peak_value,
+                    "dx_px":              sci.dx_px,
+                    "dy_px":              sci.dy_px,
+                })
+                if verdict.alerted:
+                    self._state = GuidingState.ALERTED
+                    self.controllers[0].on_alerted()
+                    self.controllers[1].on_alerted()
+                elif verdict.guiding and self._state is GuidingState.ALERTED:
+                    self._state = GuidingState.GUIDING
+                    self.controllers[0].on_resumed()
+                    self.controllers[1].on_resumed()
+                elif self._state is GuidingState.REFERENCE_SET and verdict.guiding:
+                    self._state = GuidingState.GUIDING
+
+            # Step controllers / send command. Suppression reasons are
+            # tracked distinctly per spec §7 schema.
             cmd_ra, cmd_dec, suppressed = self._step_controllers(sci)
 
             # Persist.
@@ -5055,7 +5097,7 @@ class Worker:
                 frame_number=frame, sutr_number=sutr,
                 timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%S",
                                             time.gmtime()),
-                frame_path="",  # filled when watcher passes path through
+                frame_path=str(path),
                 ramp_complete=False,
                 ha_hours=None, dec_deg=None, pa_deg=None, airmass=None,
                 temperature_c=None, focus_position=None,
@@ -5072,6 +5114,11 @@ class Worker:
     ) -> tuple[float | None, float | None, str | None]:
         if sci.dx_px is None or sci.dy_px is None:
             return None, None, None
+        if self._state is GuidingState.ALERTED:
+            return None, None, "alerted"
+        from .tcs_client import ConnectionState
+        if self.tcs.state is not ConnectionState.CONNECTED:
+            return None, None, "tcs_disconnected"
         dra, ddec = detector_to_sky(
             sci.dx_px, sci.dy_px,
             self.cfg.tcs.plate_scale_arcsec_per_px,
@@ -5082,12 +5129,39 @@ class Worker:
         cmd_dec = self.controllers[1].step(ddec)
         if cmd_ra == 0.0 and cmd_dec == 0.0:
             return 0.0, 0.0, "deadband"
+        # Snapshot suppression counters before send so we can detect
+        # which path suppressed (pacing vs disconnect).
+        before_pacing = self.tcs.commands_suppressed_pacing
+        before_disc   = self.tcs.commands_suppressed_disconnected
         sent = self.tcs.send_guide(cmd_ra, cmd_dec)
-        suppressed = None
-        if not sent:
-            suppressed = "pacing"  # simplification; real worker tracks
-                                    # disconnect vs pacing distinctly
-        return cmd_ra, cmd_dec, suppressed
+        if sent:
+            return cmd_ra, cmd_dec, None
+        if self.tcs.commands_suppressed_pacing > before_pacing:
+            return cmd_ra, cmd_dec, "pacing"
+        if self.tcs.commands_suppressed_disconnected > before_disc:
+            return cmd_ra, cmd_dec, "tcs_disconnected"
+        return cmd_ra, cmd_dec, "unknown"
+
+    def _enter_stale_alert(self) -> None:
+        """State transition for the stale-frame timeout.
+
+        Per spec §4 stale-frame watchdog: drops to REFERENCE_PENDING,
+        discards the in-memory template, resets out-of-family stats,
+        and (in the GUI) plays the stale-frame audio alert. This method
+        is idempotent — calling it again while already in
+        REFERENCE_PENDING is a no-op.
+        """
+        if self._state is GuidingState.REFERENCE_PENDING:
+            return
+        log.error("Stale-frame timeout — guiding stopped, no frames received.")
+        self._state = GuidingState.REFERENCE_PENDING
+        self._template = None
+        self.quality = OutOfFamilyDetector(
+            window=self.cfg.quality.out_of_family_window,
+            warmup=self.cfg.quality.out_of_family_warmup_n,
+            sigma_threshold=self.cfg.quality.out_of_family_sigma,
+            auto_resume_in_family=self.cfg.quality.auto_resume_in_family,
+        )
 
     def _maybe_refresh_template(self, frame_number: int, path: str) -> None:
         if self._template is None or self.cfg.reduction.auto_refresh_template:
@@ -5218,5 +5292,26 @@ End of Chunk 6. Working state: the autoguider runs from the command
 line. Files in the watched directory are processed end-to-end through
 the reducer + controllers + TCS client + SQLite store. Only the GUI is
 missing for the user-facing experience.
+
+**Deferred to Chunk 7 / commissioning** (not bugs in Chunk 6, but
+explicit limits the implementer should know):
+
+- **Target-switch detection.** `TargetSwitchDetector` is constructed
+  in the worker but not yet wired into `_loop`. Wiring requires
+  reading `RA`, `Dec`, and `OBJECT` from each SUTR's FITS header —
+  cheap (the header is already in memory after `astropy.io.fits.open`)
+  but needs the watcher to surface header keywords on the SUTR queue.
+  Promoted in Chunk 7 once the GUI's settings dialog can configure the
+  target-switch threshold and OBJECT keyword name.
+- **CLI signal race.** `signal.pause()` followed by a `not stop` check
+  has a race window where SIGINT can fire between the two and the
+  process hangs. v1 uses `signal.pause()` for simplicity; if it bites,
+  swap in `signal.sigwait([signal.SIGINT])` (Linux) or a
+  `threading.Event().wait()` driven from the SIGINT handler.
+- **`build_template` exception path inside `Worker.run` setup.** If
+  any constructor between `Watcher.start_unmanaged` and the `yield`
+  raises, the watcher leaks. Acceptable for v1 given construction is a
+  few cheap calls; if it ever becomes an issue, restructure with
+  `contextlib.ExitStack`.
 
 ---
