@@ -114,6 +114,13 @@ class HenriettaApp(App):
         Binding("c", "change_watch_dir", "Change watch dir"),
         Binding("i", "toggle_image", "Show/hide image window"),
         Binding("question_mark", "help", "Help"),
+        # Arrow-key focus navigation (in addition to textual's default
+        # Tab / Shift+Tab). Falls through any widget that consumes arrows
+        # internally (Input cursor, DataTable selection, etc.).
+        Binding("up", "focus_previous", show=False),
+        Binding("down", "focus_next", show=False),
+        Binding("left", "focus_previous", show=False),
+        Binding("right", "focus_next", show=False),
     ]
     DRAIN_INTERVAL_S = 0.2
 
