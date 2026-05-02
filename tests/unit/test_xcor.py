@@ -102,12 +102,13 @@ class TestXcor2D:
         assert result.curvature_x < 0.0
         assert result.curvature_y < 0.0
 
-    def test_default_search_radius_is_three(self):
-        # Defaults to 3 because typical Henrietta motion is sub-pixel
-        # (plate scale ~0.7"/px); ±3 is already generous.
+    def test_default_search_radius_is_four(self):
+        # Defaults to 4 because that's close to the guider's per-command
+        # range (±2.5" ÷ ~0.7"/px ≈ ±3.6 px); wider search is wasted work
+        # since we couldn't correct it in one frame anyway.
         import inspect
 
         from henrietta_guider.core import xcor as xcor_module
 
         sig = inspect.signature(xcor_module.xcor_2d)
-        assert sig.parameters["search"].default == 3
+        assert sig.parameters["search"].default == 4

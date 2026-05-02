@@ -18,9 +18,10 @@ overlap-area effect (smaller area at non-zero shifts) dominates the
 correlation and the peak gets pinned at (0, 0). The production reducer
 runs `subtract_local_sky` before calling this.
 
-The default search radius (3 px) reflects realistic Henrietta motion:
-plate scale ~0.7\"/px, typical drifts << 1 pixel; 3 px is generous. If
-a real on-sky run shows larger excursions, raise via config rather than
+The default search radius (4 px) is close to the guider's per-command
+range (±2.5\" ÷ ~0.7\"/px ≈ ±3.6 px). Anything beyond that we couldn't
+correct in one frame anyway, so wider search is wasted work. If a real
+on-sky run shows larger excursions, raise via config rather than
 defaulting wider.
 """
 
@@ -43,7 +44,7 @@ class XcorResult:
 def xcor_2d(
     data: np.ndarray,
     template: np.ndarray,
-    search: int = 3,
+    search: int = 4,
 ) -> XcorResult:
     """Brute-force 2-D xcor with parabolic sub-pixel peak.
 
