@@ -14,6 +14,20 @@ def write_fits(path: Path, data: np.ndarray) -> None:
     fits.PrimaryHDU(data.astype(np.int16)).writeto(path, overwrite=True)
 
 
+def _gaussian_column(
+    ny: int,
+    nx: int,
+    x_center: float,
+    amp: float = 1000.0,
+    sigma: float = 1.5,
+    sky: float = 200.0,
+) -> np.ndarray:
+    x = np.arange(nx)[None, :].astype(np.float32)
+    img = np.full((ny, nx), sky, dtype=np.float32)
+    img += amp * np.exp(-((x - x_center) ** 2) / (2 * sigma**2))
+    return img.astype(np.int16)
+
+
 @dataclass
 class FakeArchon:
     """Writes synthetic henNNNN_sssr.fits + henNNNN.fits frames into a
@@ -24,14 +38,16 @@ class FakeArchon:
     ny: int = 256
     nx: int = 256
 
-    def write_sutr(self, frame: int, sutr: int, value: float = 50.0) -> Path:
-        p = self.out_dir / f"hen{frame:04d}_{sutr:03d}r.fits"
-        write_fits(p, np.full((self.ny, self.nx), value, dtype=np.float32))
+    def write_slope(self, frame: int, x_center: float | None = None) -> Path:
+        x = float(self.nx // 2) if x_center is None else float(x_center)
+        p = self.out_dir / f"hen{frame:04d}.fits"
+        write_fits(p, _gaussian_column(self.ny, self.nx, x))
         return p
 
-    def write_slope(self, frame: int, value: float = 200.0) -> Path:
-        p = self.out_dir / f"hen{frame:04d}.fits"
-        write_fits(p, np.full((self.ny, self.nx), value, dtype=np.float32))
+    def write_sutr(self, frame: int, sutr: int, x_center: float | None = None) -> Path:
+        x = float(self.nx // 2) if x_center is None else float(x_center)
+        p = self.out_dir / f"hen{frame:04d}_{sutr:03d}r.fits"
+        write_fits(p, _gaussian_column(self.ny, self.nx, x))
         return p
 
 

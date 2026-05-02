@@ -31,12 +31,12 @@ class TestWorkerEndToEnd:
             settle_s=0.05,
         ):
             # Send a slope file first to seed the template.
-            archon.write_slope(42, value=200.0)
+            archon.write_slope(42)
             time.sleep(0.3)  # let watcher settle and template build.
             # Then a sequence of SUTRs.
-            archon.write_sutr(43, 1, value=50.0)
-            archon.write_sutr(43, 2, value=51.0)
-            archon.write_sutr(43, 3, value=52.0)
+            archon.write_sutr(43, 1)
+            archon.write_sutr(43, 2)
+            archon.write_sutr(43, 3)
             time.sleep(0.6)
         # Verify rows landed.
         import sqlite3
@@ -68,10 +68,10 @@ class TestWorkerEndToEnd:
             tcs_socket=tcs.side_autoguider,
             settle_s=0.05,
         ):
-            archon.write_slope(42, value=200.0)
+            archon.write_slope(42)
             time.sleep(0.3)
-            archon.write_sutr(43, 1, value=50.0)
-            archon.write_sutr(43, 2, value=80.0)  # larger jump
+            archon.write_sutr(43, 1)
+            archon.write_sutr(43, 2, x_center=130)  # 2-px shift
             try:
                 frame = tcs.recv_frame(timeout_s=2.0)
                 assert frame[:1] == b"G"
