@@ -96,6 +96,21 @@ def main() -> int:
             height = float(s["y_hi"]) - y_lo
             color = s.get("color", "#FFFFFF")
             label = s.get("label", str(s.get("id", "")))
+            # Auto sky bands: outer 1/6 of the width on each side, matching
+            # core/sky.py (per-row outer-1/6 median). Drawn first so the
+            # main outline sits on top.
+            edge = max(1.0, width // 6)
+            for sx in (x_min, x_min + width - edge):
+                sky = mpatches.Rectangle(
+                    (sx, y_lo),
+                    edge,
+                    height,
+                    ec="none",
+                    fc=color,
+                    alpha=0.18,
+                )
+                ax.add_patch(sky)
+                state["rect_patches"].append(sky)
             rect = mpatches.Rectangle(
                 (x_min, y_lo),
                 width,

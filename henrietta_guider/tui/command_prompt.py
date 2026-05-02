@@ -50,6 +50,13 @@ class SetStamp:
 
 
 @dataclass(frozen=True)
+class ClearStamps:
+    """Result of `:clear` (n=None) or `:clear N`."""
+
+    n: int | None  # None = all
+
+
+@dataclass(frozen=True)
 class ShowHelp:
     """Result of `:?`."""
 
@@ -62,7 +69,7 @@ class ParseError:
     message: str
 
 
-def parse_command(text: str) -> SetStamp | ShowHelp | ParseError:
+def parse_command(text: str) -> SetStamp | ClearStamps | ShowHelp | ParseError:
     """Parse a typed command string (no leading colon).
 
     Whitespace and commas are interchangeable. Empty input is treated
@@ -73,6 +80,17 @@ def parse_command(text: str) -> SetStamp | ShowHelp | ParseError:
         return ParseError("empty command")
     if s == "?":
         return ShowHelp()
+    if s == "clear" or s.startswith("clear "):
+        rest = s[len("clear") :].strip()
+        if not rest:
+            return ClearStamps(n=None)
+        try:
+            n = int(rest)
+        except ValueError:
+            return ParseError(f"`clear` takes nothing or 1/2/3 (got `{rest}`)")
+        if n not in STAMP_LABELS:
+            return ParseError(f"`clear N`: N must be 1, 2, or 3 (got {n})")
+        return ClearStamps(n=n)
     parts = s.replace(",", " ").split()
     if len(parts) != 5:
         return ParseError(f"expected `N x_min y_lo x_max y_hi` (5 values) — got {len(parts)}")
@@ -173,12 +191,27 @@ class CommandHelp(ModalScreen):
                 ":3 x_min y_lo x_max y_hi    set reference stamp (blue)",
                 classes="row",
             )
+            yield Static(":clear                        clear all stamps", classes="row")
+            yield Static(
+                ":clear N                      clear stamp N (1/2/3)",
+                classes="row",
+            )
             yield Static(":?                            this help", classes="row")
             yield Static("", classes="row")
             yield Static(
-                "Coordinates are detector pixels. Stamps overlay the live "
-                "matplotlib image; they are visualization-only at this "
-                "stage (not yet wired into the worker's reduction).",
+                "Coordinates are detector pixels. Sky-band overlays "
+                "(outer 1/6 of the X width) are auto-drawn from each stamp.",
+                classes="row",
+            )
+            yield Static(
+                "If a box is already set, you must `:clear N` before "
+                "`:N` will accept new coordinates.",
+                classes="row",
+            )
+            yield Static(
+                "Stamps overlay the live matplotlib image only — the "
+                "worker's reducer still uses the science stamp it was "
+                "constructed from.",
                 classes="row",
             )
             yield Static("", classes="row")

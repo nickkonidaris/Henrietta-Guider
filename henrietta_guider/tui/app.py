@@ -37,6 +37,7 @@ from henrietta_guider.core.worker import Worker
 from henrietta_guider.tui.command_prompt import (
     STAMP_COLORS,
     STAMP_LABELS,
+    ClearStamps,
     CommandHelp,
     CommandPrompt,
     ParseError,
@@ -489,7 +490,35 @@ class HenriettaApp(App):
         if isinstance(result, ShowHelp):
             self.push_screen(CommandHelp())
             return
+        if isinstance(result, ClearStamps):
+            if result.n is None:
+                if not self._stamps_by_n:
+                    self.notify("no stamps to clear", severity="information")
+                    return
+                self._stamps_by_n.clear()
+                self.notify("cleared all stamps", severity="information")
+            elif result.n in self._stamps_by_n:
+                del self._stamps_by_n[result.n]
+                self.notify(
+                    f"cleared {STAMP_LABELS[result.n]} stamp",
+                    severity="information",
+                )
+            else:
+                self.notify(
+                    f"{STAMP_LABELS[result.n]} stamp not set",
+                    severity="warning",
+                )
+                return
+            self._push_stamps_to_image()
+            return
         if isinstance(result, SetStamp):
+            if result.n in self._stamps_by_n:
+                self.notify(
+                    f"{STAMP_LABELS[result.n]} stamp already set; "
+                    f"`:clear {result.n}` to remove it first",
+                    severity="warning",
+                )
+                return
             self._stamps_by_n[result.n] = {
                 "id": result.n,
                 "x_min": result.x_min,
