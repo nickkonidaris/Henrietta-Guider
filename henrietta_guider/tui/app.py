@@ -151,7 +151,14 @@ class HenriettaApp(App):
             TimeSeries("xcor peak", lambda r: r.xcor_peak_value),
             TimeSeries("rotation (deg)", lambda r: self._latest_rotation),
         ]
-        self._snr_histogram = SnrHistogram(title="SNR √(e⁻) per pixel")
+        # SNR is a histogram of the per-frame integrated SNR scalar
+        # (sqrt(total_e) over the science stamp), accumulated over a
+        # rolling window. Operator wants to see the distribution, not
+        # the time-series.
+        self._snr_histogram = SnrHistogram(
+            title="integrated SNR √(e⁻)",
+            getter=lambda r: r.signal_snr,
+        )
         # Stack: time-series + histogram (same widget category for
         # layout — see compose()).
         self._stack: list[Widget] = [*self._timeseries, self._snr_histogram]
@@ -195,9 +202,7 @@ class HenriettaApp(App):
         self._latest_rotation = getattr(evt, "field_rotation_deg", None)
         for ts in self._timeseries:
             ts.append(sci)
-        self._snr_histogram.update_values(
-            getattr(evt, "science_pixel_signal_snr", None),
-        )
+        self._snr_histogram.append(sci)
         self._control_panel.update_readouts(
             sci.dx_px,
             sci.dy_px,
@@ -231,21 +236,22 @@ class HenriettaApp(App):
         import random
         import time
 
-        import numpy as np
-
         from henrietta_guider.core.types import MeasurementRow
         from henrietta_guider.core.worker import WorkerEvent
 
         self._demo_t0 = time.time()
-        rng = np.random.default_rng(0)
 
         def tick():
             t = time.time() - self._demo_t0
+            # Integrated SNR ~ sqrt(total_e). For a bright trace over
+            # ~2000 stamp pixels with ~5000 e/pix, total_e ~ 10^7 and
+            # sqrt ~ 3000. Vary slowly to mimic transparency drift.
+            integrated_snr = 3000.0 + 200.0 * math.sin(t * 0.05) + 80.0 * random.random()
             sci = MeasurementRow(
                 frame_number=int(t),
                 sutr_number=1,
                 stamp_id=0,
-                signal_snr=10.0 + 2.0 * math.sin(t * 0.3),
+                signal_snr=integrated_snr,
                 dx_px=0.5 * math.sin(t * 0.5),
                 dy_px=0.4 * math.cos(t * 0.4),
                 xcor_peak_value=1e6 + 1e5 * random.random(),
@@ -261,16 +267,10 @@ class HenriettaApp(App):
                 template_frame_number=0,
                 quality_flags=(),
             )
-            # Synthesize a plausible per-pixel SNR distribution: most
-            # pixels near sky-noise (small SNR), a tail from the trace.
-            sky = rng.normal(loc=2.0, scale=0.6, size=350).clip(0.1)
-            trace = rng.normal(loc=12.0, scale=2.5, size=50).clip(0.1)
-            snr_sample: tuple[float, ...] = (*sky, *trace)
             evt = WorkerEvent(
                 rows=[sci],
                 state=self.state,
                 field_rotation_deg=0.001 * math.sin(t * 0.2),
-                science_pixel_signal_snr=snr_sample,
             )
             self._on_measurement(evt)
 
