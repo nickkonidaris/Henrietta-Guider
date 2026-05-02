@@ -58,6 +58,7 @@ class WorkerEvent:
     cmd_ra_arcsec: float | None = None
     cmd_dec_arcsec: float | None = None
     cmd_suppressed_by: str | None = None
+    field_rotation_deg: float | None = None
 
 
 class Worker:
@@ -267,7 +268,16 @@ class Worker:
                 guiding_state=self._state.name,
             )
             self.store.write_frame(frame_rec, rows)
-            self.measurement_events.put(WorkerEvent(rows=rows, state=self._state))
+            self.measurement_events.put(
+                WorkerEvent(
+                    rows=rows,
+                    state=self._state,
+                    cmd_ra_arcsec=cmd_ra,
+                    cmd_dec_arcsec=cmd_dec,
+                    cmd_suppressed_by=suppressed,
+                    field_rotation_deg=field_rotation_deg,
+                )
+            )
 
     def _step_controllers(
         self,
