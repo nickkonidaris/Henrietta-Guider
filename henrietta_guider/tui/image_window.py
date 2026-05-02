@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import queue
+import sys
 import threading
 from collections.abc import Callable
 
@@ -42,6 +43,17 @@ class ImageWindow:
     def start(self) -> None:
         """Start the side thread. Returns even if no display is
         available; in that case the TUI surfaces 'image: unavailable'."""
+        if sys.platform == "darwin":
+            # macOS AppKit requires Tk to live on the main thread; the
+            # textual TUI already owns the main thread. Running Tk on a
+            # side thread crashes with NSInternalInconsistencyException.
+            # The image window must run in a separate process on macOS;
+            # see TODO(image-window-subprocess) in the project deferrals.
+            log.warning(
+                "Image side-window disabled on macOS in-process "
+                "(Tk needs the main thread; run in a separate process)"
+            )
+            return
         try:
             import matplotlib
 
