@@ -1,12 +1,27 @@
 """2-D cross-correlation with parabolic sub-pixel peak (ALGORITHM.md).
 
-For each candidate (dx, dy) in a +/- search window, compute:
-    C(dx, dy) = sum_y sum_x  T(x, y) * D(x + dx, y + dy)
+For each candidate (dx, dy) in a +/- search window, compute the SLICED
+overlap correlation (no wraparound):
+
+    C(dx, dy) = sum over the OVERLAP REGION of T(x, y) * D(x + dx, y + dy)
+
 The integer peak is at argmax(C). A parabolic fit to the three
 correlation values around the peak in each axis independently gives
 sub-pixel refinement:
+
     sub = 0.5 * (a - c) / (a - 2b + c)
+
 The curvature (a - 2b + c) is recorded as a precision proxy.
+
+Caller contract: pass mean-zero (sky-subtracted) inputs. Otherwise the
+overlap-area effect (smaller area at non-zero shifts) dominates the
+correlation and the peak gets pinned at (0, 0). The production reducer
+runs `subtract_local_sky` before calling this.
+
+The default search radius (3 px) reflects realistic Henrietta motion:
+plate scale ~0.7\"/px, typical drifts << 1 pixel; 3 px is generous. If
+a real on-sky run shows larger excursions, raise via config rather than
+defaulting wider.
 """
 
 from __future__ import annotations
@@ -28,16 +43,15 @@ class XcorResult:
 def xcor_2d(
     data: np.ndarray,
     template: np.ndarray,
-    search: int = 12,
+    search: int = 3,
 ) -> XcorResult:
     """Brute-force 2-D xcor with parabolic sub-pixel peak.
 
     Sign convention: returns the (dx, dy) such that
-    ``data ~= np.roll(template, (dy, dx))``. So a positive dx means the
-    data is shifted to the +X direction relative to the template, and
-    the integer-shift unit test ``data = np.roll(template, dx=+3, axis=1)``
-    recovers ``dx_px ~= +3``. Downstream geometry.py negates this to
-    produce the telescope correction.
+    ``data ~ shift(template, (dy, dx))``. So a positive dx means the
+    data is shifted in the +X direction relative to the template.
+    Downstream geometry.py negates this to produce the telescope
+    correction.
     """
     if data.shape != template.shape:
         raise ValueError(f"shape mismatch: {data.shape} vs {template.shape}")
@@ -47,17 +61,18 @@ def xcor_2d(
     n_dy = 2 * search + 1
     C = np.zeros((n_dy, n_dx), dtype=np.float64)
 
-    # For each candidate (dx, dy), roll D by (-dy, -dx) so that
-    # D'[y, x] = D[y + dy, x + dx], then sum T * D'. We use cyclic
-    # np.roll (rather than slicing the overlap) because for small
-    # search windows (+/- 12) and a ~70k-pixel stamp, the wraparound
-    # bias is negligible relative to the central correlation peak,
-    # and the simpler implementation avoids overlap-area effects that
-    # otherwise bias the peak toward (0, 0) on positive-valued stamps.
     for iy, dy in enumerate(range(-search, search + 1)):
         for ix, dx in enumerate(range(-search, search + 1)):
-            rolled = np.roll(np.roll(data, -dy, axis=0), -dx, axis=1)
-            C[iy, ix] = float(np.sum(template * rolled))
+            y_lo_t = max(0, -dy)
+            y_hi_t = ny - max(0, dy)
+            x_lo_t = max(0, -dx)
+            x_hi_t = nx - max(0, dx)
+            t_view = template[y_lo_t:y_hi_t, x_lo_t:x_hi_t]
+            d_view = data[
+                y_lo_t + dy : y_hi_t + dy,
+                x_lo_t + dx : x_hi_t + dx,
+            ]
+            C[iy, ix] = float(np.sum(t_view * d_view))
 
     iy_peak, ix_peak = np.unravel_index(int(np.argmax(C)), C.shape)
     peak_value = float(C[iy_peak, ix_peak])

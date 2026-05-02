@@ -44,7 +44,7 @@ class ReductionConfig:
     stamp_x_halfwidth_px: int = 25
     stamp_y_lo: int = 600
     stamp_y_hi: int = 1980
-    xcor_search_radius_px: int = 12
+    xcor_search_radius_px: int = 3
     auto_refresh_template: bool = False
     template_min_peak_value: float = 0.0
 

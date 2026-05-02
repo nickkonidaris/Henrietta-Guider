@@ -31,7 +31,7 @@ class TestConfigDefaults:
         assert c.reduction.stamp_x_halfwidth_px == 25
         assert c.reduction.stamp_y_lo == 600
         assert c.reduction.stamp_y_hi == 1980
-        assert c.reduction.xcor_search_radius_px == 12
+        assert c.reduction.xcor_search_radius_px == 3
         assert c.reduction.auto_refresh_template is False
 
     def test_detector_defaults(self):

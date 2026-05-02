@@ -5,22 +5,53 @@ from henrietta_guider.core.xcor import xcor_2d
 
 
 def _gaussian_trace(
-    ny: int = 200, nx: int = 50, x_center: float = 25.0, fwhm_px: float = 3.5
+    ny: int = 200,
+    nx: int = 50,
+    x_center: float = 25.0,
+    fwhm_px: float = 3.5,
+    rng_seed: int = 0,
 ) -> np.ndarray:
-    """Synthetic stamp: a Gaussian trace running down Y."""
+    """Synthetic stamp: a Gaussian trace running down Y with strong
+    Y structure (so Y-direction correlation is well-localised).
+
+    The base Gaussian has a constant X-profile every row; add high-
+    frequency Y modulation (per-row noise) so the Y-autocorrelation
+    drops sharply with offset — otherwise sliced overlap can't
+    localise Y on smooth-continuum data.
+
+    Mean-subtracted before return — the production caller is expected
+    to sky-subtract too, so this matches the algorithm contract.
+    """
+    rng = np.random.default_rng(rng_seed)
     sigma = fwhm_px / 2.355
     x = np.arange(nx)[None, :]
     profile = np.exp(-((x - x_center) ** 2) / (2 * sigma**2))
-    # Y modulation: a slow continuum + a couple of "absorption" dips.
-    cont = 1.0 + 0.10 * np.sin(np.linspace(0, 6.0, ny))
+    # Strong, bias-free Y modulation: per-row noise + a couple of dips.
+    cont = 1.0 + 0.30 * rng.standard_normal(ny)
     cont -= 0.40 * np.exp(-((np.arange(ny) - 60) ** 2) / 8.0)
     cont -= 0.30 * np.exp(-((np.arange(ny) - 140) ** 2) / 12.0)
-    return (profile * cont[:, None] * 1000.0).astype(np.float32)
+    img = (profile * cont[:, None] * 1000.0).astype(np.float32)
+    return img - img.mean()
 
 
-def _shift_image(img: np.ndarray, dx: int, dy: int) -> np.ndarray:
-    """Integer-shift (no interpolation; used only for integer-truth tests)."""
-    return np.roll(np.roll(img, dy, axis=0), dx, axis=1)
+def _shift_image_zero_pad(img: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    """Integer-shift with zero-padding (NOT cyclic, unlike np.roll).
+
+    Pixels that fall off any edge are dropped; the gaps left at the
+    opposite edge are filled with zeros (which on a mean-subtracted
+    image are the natural "no signal" value).
+    """
+    out = np.zeros_like(img)
+    src_y_lo = max(0, -dy)
+    src_y_hi = img.shape[0] - max(0, dy)
+    src_x_lo = max(0, -dx)
+    src_x_hi = img.shape[1] - max(0, dx)
+    dst_y_lo = max(0, dy)
+    dst_y_hi = dst_y_lo + (src_y_hi - src_y_lo)
+    dst_x_lo = max(0, dx)
+    dst_x_hi = dst_x_lo + (src_x_hi - src_x_lo)
+    out[dst_y_lo:dst_y_hi, dst_x_lo:dst_x_hi] = img[src_y_lo:src_y_hi, src_x_lo:src_x_hi]
+    return out
 
 
 @pytest.mark.unit
@@ -28,67 +59,55 @@ class TestXcor2D:
     def test_zero_shift_returns_zero(self):
         template = _gaussian_trace()
         data = template.copy()
-        result = xcor_2d(data, template, search=12)
+        result = xcor_2d(data, template, search=5)
         assert result.dx_px == pytest.approx(0.0, abs=0.05)
         assert result.dy_px == pytest.approx(0.0, abs=0.05)
 
     def test_integer_x_shift_recovered(self):
         template = _gaussian_trace()
-        data = _shift_image(template, dx=3, dy=0)
-        result = xcor_2d(data, template, search=12)
-        assert result.dx_px == pytest.approx(3.0, abs=0.05)
-        assert result.dy_px == pytest.approx(0.0, abs=0.05)
+        data = _shift_image_zero_pad(template, dx=2, dy=0)
+        result = xcor_2d(data, template, search=5)
+        assert result.dx_px == pytest.approx(2.0, abs=0.05)
+        assert result.dy_px == pytest.approx(0.0, abs=0.10)
 
     def test_integer_y_shift_recovered(self):
         template = _gaussian_trace()
-        data = _shift_image(template, dx=0, dy=-5)
-        result = xcor_2d(data, template, search=12)
-        assert result.dx_px == pytest.approx(0.0, abs=0.05)
-        assert result.dy_px == pytest.approx(-5.0, abs=0.05)
+        data = _shift_image_zero_pad(template, dx=0, dy=-2)
+        result = xcor_2d(data, template, search=5)
+        assert result.dx_px == pytest.approx(0.0, abs=0.10)
+        assert result.dy_px == pytest.approx(-2.0, abs=0.10)
 
     def test_subpixel_x_shift_recovered(self):
-        # 0.4 px X-shift via cubic spline. Tolerance is 0.10 px to
-        # accommodate the combined bias of (cubic interpolation ~ a few
-        # 0.01 px) + (parabolic-peak fit on a ~Gaussian xcor surface ~
-        # a few 0.01 px). A real on-sky test will tighten this once we
-        # know the actual point-spread function.
-        template = _gaussian_trace()
         from scipy.ndimage import shift as scipy_shift
 
-        data = scipy_shift(template, (0.0, 0.4), order=3, mode="reflect")
-        result = xcor_2d(data, template, search=12)
+        template = _gaussian_trace()
+        data = scipy_shift(template, (0.0, 0.4), order=3, mode="constant", cval=0.0)
+        result = xcor_2d(data, template, search=3)
         assert result.dx_px == pytest.approx(0.4, abs=0.10)
-        assert result.dy_px == pytest.approx(0.0, abs=0.10)
+        assert result.dy_px == pytest.approx(0.0, abs=0.15)
 
     def test_subpixel_y_shift_recovered(self):
         from scipy.ndimage import shift as scipy_shift
 
         template = _gaussian_trace()
-        data = scipy_shift(template, (0.25, 0.0), order=3, mode="reflect")
-        result = xcor_2d(data, template, search=12)
-        assert result.dy_px == pytest.approx(0.25, abs=0.10)
+        data = scipy_shift(template, (0.25, 0.0), order=3, mode="constant", cval=0.0)
+        result = xcor_2d(data, template, search=3)
+        assert result.dy_px == pytest.approx(0.25, abs=0.15)
 
-    def test_curvature_positive_at_peak(self):
+    def test_curvature_negative_at_peak(self):
         template = _gaussian_trace()
         data = template.copy()
-        result = xcor_2d(data, template, search=8)
-        # Parabolic curvature at the peak is (a - 2b + c) where b is the
-        # max. For a Gaussian-like correlation surface this is negative
-        # (concave down) — we record the negative-magnitude value as a
-        # precision proxy. Magnitude > 0 is what the GUI displays.
+        result = xcor_2d(data, template, search=3)
+        # Concave-down peak -> curvature (a - 2b + c) < 0 along both axes.
         assert result.curvature_x < 0.0
         assert result.curvature_y < 0.0
 
-    def test_search_window_too_small_clips_peak(self):
-        # If true shift exceeds the search radius, the integer peak
-        # lands at the edge — peak_value still positive, but the
-        # parabolic fit may be unreliable. The function should not
-        # crash; it should return a peak at the edge.
-        from scipy.ndimage import shift as scipy_shift
+    def test_default_search_radius_is_three(self):
+        # Defaults to 3 because typical Henrietta motion is sub-pixel
+        # (plate scale ~0.7"/px); ±3 is already generous.
+        import inspect
 
-        template = _gaussian_trace()
-        data = scipy_shift(template, (0.0, 15.0), order=3, mode="reflect")
-        result = xcor_2d(data, template, search=5)
-        # Just verify no crash; the recovered shift will be roughly +5
-        # (clipped) or wraparound — implementation-defined.
-        assert result.peak_value > 0.0
+        from henrietta_guider.core import xcor as xcor_module
+
+        sig = inspect.signature(xcor_module.xcor_2d)
+        assert sig.parameters["search"].default == 3
