@@ -40,11 +40,16 @@ class TimeSeries(Widget):
 
     def render(self) -> Text:
         if not self.buffer:
-            return Text(f"{self.title:>20}  (no data)")
+            return Text(f"{self.title}: (no data)")
         plt.clf()
         plt.theme("clear")
-        plt.plotsize(self.size.width - 22, self.size.height)
+        # frame(False) drops plotext's box border — the top edge ran one
+        # column past the bottom edge with the default frame, which looked
+        # like a misaligned "overbar" above the plot. Title is rendered by
+        # plotext (centered) so the multi-line body is self-consistent.
+        plt.frame(False)
+        plt.title(self.title)
+        plt.plotsize(self.size.width, self.size.height)
         ys = [(y if y is not None else float("nan")) for y in self.buffer]
         plt.plot(ys)
-        body = plt.build()
-        return Text.from_ansi(f"{self.title:>20}  {body}")
+        return Text.from_ansi(plt.build())
