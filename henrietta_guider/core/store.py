@@ -104,7 +104,10 @@ class Store:
     def open(cls, path: str | Path):
         p = Path(path).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(p))
+        # Opened on the controller thread but written by the worker thread; reads
+        # happen on the main thread after the worker stops. There is never concurrent
+        # access (the worker is the sole writer), so disable the same-thread check.
+        conn = sqlite3.connect(str(p), check_same_thread=False)
         try:
             conn.execute("PRAGMA journal_mode = WAL;")
             conn.executescript(_SCHEMA)
