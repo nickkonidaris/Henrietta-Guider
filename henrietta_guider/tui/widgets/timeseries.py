@@ -11,7 +11,16 @@ from textual.widget import Widget
 
 
 class TimeSeries(Widget):
-    DEFAULT_CSS = "TimeSeries { height: 4; }"
+    # 1fr lets the 8-widget stack divide the available vertical space
+    # equally; min-height keeps a useful Y range when the terminal is
+    # short. plotext draws 3 reserved rows (title/x-axis/x-ticks) so a
+    # height below ~7 collapses the plot to 1 row of data.
+    DEFAULT_CSS = """
+    TimeSeries {
+        height: 1fr;
+        min-height: 7;
+    }
+    """
 
     def __init__(
         self,

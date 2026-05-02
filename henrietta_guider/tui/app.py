@@ -90,6 +90,15 @@ class HenriettaApp(App):
     and references to the worker + the (optional) image side-window."""
 
     CSS_PATH = None
+    DEFAULT_CSS = """
+    /* The body Horizontal sits between Header/Alerts and Footer; it must
+       claim the remaining vertical space so the time-series Vertical and
+       the ControlPanel actually appear side-by-side at full height.
+       Without this the Horizontal collapses to children's natural height
+       and the ControlPanel's right column ends up out of view. */
+    Horizontal { height: 1fr; }
+    Horizontal > Vertical { height: 1fr; width: 1fr; }
+    """
     BINDINGS = [
         Binding("d", "draw_science", "Draw science"),
         Binding("a", "add_comparison", "Add comparison"),
