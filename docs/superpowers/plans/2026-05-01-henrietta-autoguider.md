@@ -3523,10 +3523,12 @@ class TestReducer:
         good_full = np.ones((2048, 2048), dtype=bool)
         return Reducer(K=K, stride=stride, gain_e_per_dn=4.0, bpm_good=good_full)
 
-    def test_first_sutr_no_guide_image_but_signal_snr_zero(self):
+    def test_first_sutr_no_guide_image_signal_snr_is_none(self):
         red = self._make()
         stamp, tmpl = _stamp(), _template(_stamp())
-        # Frame 10, SUTR 1 (the reset read): no guide image yet.
+        # Frame 10, SUTR 1 (the reset read itself): no guide image yet,
+        # and signal_DN = read - reset = 0 -> total_e <= 0 -> NULL per
+        # spec §4.
         rows = red.reduce_sutr(
             frame_number=10, sutr_number=1, raw_read=_full_frame(50.0),
             stamps_and_templates=[(stamp, tmpl, 0)],
@@ -3534,8 +3536,7 @@ class TestReducer:
         assert len(rows) == 1
         row = rows[0]
         assert row.dx_px is None  # no guide image yet
-        # signal_DN = read - reset_read = 0 -> signal_snr = sqrt(0) = 0.
-        assert row.signal_snr == pytest.approx(0.0)
+        assert row.signal_snr is None
 
     def test_second_sutr_emits_guide_image_and_xcor(self):
         red = self._make()
@@ -3572,9 +3573,9 @@ class TestReducer:
         rows = red.reduce_sutr(11, 1, _full_frame(80.0),
                                stamps_and_templates=[(stamp, tmpl, 0)])
         assert rows[0].dx_px is None
-        # signal_snr now relative to frame 11's reset (80.0 itself), so
-        # signal_DN = 0 -> signal_snr ≈ 0.
-        assert rows[0].signal_snr == pytest.approx(0.0)
+        # signal_snr is relative to frame 11's reset (80.0 itself):
+        # total_e <= 0 -> NULL per spec §4.
+        assert rows[0].signal_snr is None
 
     def test_sanity_discard_returns_empty(self):
         red = self._make()
@@ -3654,6 +3655,7 @@ class Reducer:
         self.xcor_search = xcor_search
         self._reset_read: np.ndarray | None = None
         self._reset_read_frame: int | None = None
+        self._warned: set[str] = set()
 
     def reduce_sutr(
         self,
@@ -3751,7 +3753,16 @@ class Reducer:
         stamp: Stamp,
         good_stamp: np.ndarray,
     ) -> float | None:
+        """Per spec §4: NULL on (reset-read itself, zero unmasked pixels,
+        or any path where total_e ≤ 0). NULL is signaled by returning
+        None; the store maps None to SQL NULL. A WARNING is logged on
+        the first occurrence per session per cause (not per frame) so
+        the operator notices a misconfigured stamp without log spam.
+        """
         if self._reset_read is None:
+            return None
+        if not good_stamp.any():
+            self._warn_once("signal_snr: zero unmasked pixels in stamp")
             return None
         sig_DN = (
             raw_read[stamp.y_lo : stamp.y_hi, stamp.x_min : stamp.x_max]
@@ -3759,12 +3770,22 @@ class Reducer:
         )
         sig_e = float(np.sum(np.where(good_stamp, sig_DN, 0.0))) * self.gain_e_per_dn
         if sig_e <= 0.0:
-            return 0.0
+            self._warn_once("signal_snr: total_e <= 0 (sub-reset read)")
+            return None
         return float(np.sqrt(sig_e))
 
+    def _warn_once(self, message: str) -> None:
+        if message in self._warned:
+            return
+        import logging
+        logging.getLogger(__name__).warning(message)
+        self._warned.add(message)
+
     def _trace_fwhm(self, sub: np.ndarray) -> float:
-        # Collapse along Y to a 1-D spatial profile, fit a Gaussian
-        # FWHM. Cheap second-moment estimate is fine for v1.
+        # Collapse along Y to a 1-D spatial profile, take FWHM from the
+        # second moment. v1 only: spec §4 specifies a 1-D Gaussian fit;
+        # promote this to scipy.optimize.curve_fit if the second-moment
+        # estimate is found insufficient during commissioning.
         profile = sub.sum(axis=0)
         if profile.sum() <= 0:
             return float("nan")
@@ -3867,20 +3888,73 @@ class TestStore:
             frame = self._frame()
             row = self._row()
             st.write_frame(frame, [row])
-            # Read back via a fresh connection.
-            with sqlite3.connect(db) as conn:
-                conn.row_factory = sqlite3.Row
-                f_row = conn.execute(
-                    "SELECT * FROM frames WHERE frame_number=10 AND sutr_number=5"
-                ).fetchone()
-                assert f_row["timestamp_utc"] == frame.timestamp_utc
-                assert f_row["guiding_state"] == "GUIDING"
-                m_row = conn.execute(
-                    "SELECT * FROM stamp_measurements "
-                    "WHERE frame_number=10 AND sutr_number=5 AND stamp_id=0"
-                ).fetchone()
-                assert m_row["dx_px"] == pytest.approx(0.05)
-                assert json.loads(m_row["quality_flags"]) == ["frame_skip"]
+        # Read back via a fresh connection (proves data was committed
+        # and is durable across the close).
+        with sqlite3.connect(db) as conn:
+            conn.row_factory = sqlite3.Row
+            f_row = conn.execute(
+                "SELECT * FROM frames WHERE frame_number=10 AND sutr_number=5"
+            ).fetchone()
+            assert f_row["timestamp_utc"] == frame.timestamp_utc
+            assert f_row["guiding_state"] == "GUIDING"
+            assert f_row["ramp_complete"] == 0  # bool False -> int 0
+            m_row = conn.execute(
+                "SELECT * FROM stamp_measurements "
+                "WHERE frame_number=10 AND sutr_number=5 AND stamp_id=0"
+            ).fetchone()
+            assert m_row["dx_px"] == pytest.approx(0.05)
+            assert m_row["signal_snr"] == pytest.approx(210.0)
+            assert json.loads(m_row["quality_flags"]) == ["frame_skip"]
+
+    def test_ramp_complete_true_round_trip(self, tmp_path: Path):
+        db = tmp_path / "ramp.db"
+        with Store.open(db) as st:
+            frame = FrameRecord(
+                frame_number=42, sutr_number=23,
+                timestamp_utc="2026-04-30T08:14:22.137",
+                frame_path="/x/hen0042.fits",
+                ramp_complete=True,                      # the slope-fit final
+                ha_hours=None, dec_deg=None, pa_deg=None, airmass=None,
+                temperature_c=None, focus_position=None,
+                cmd_ra_arcsec=None, cmd_dec_arcsec=None,
+                cmd_suppressed_by="alerted",
+                err_ra_arcsec=None, err_dec_arcsec=None,
+                guiding_state="ALERTED",
+            )
+            st.write_frame(frame, [])
+        with sqlite3.connect(db) as conn:
+            (rc,) = conn.execute(
+                "SELECT ramp_complete FROM frames WHERE frame_number=42"
+            ).fetchone()
+            assert rc == 1  # bool True -> int 1
+
+    def test_empty_quality_flags_round_trip(self, tmp_path: Path):
+        # The common case: an in-family frame with no sanity tags.
+        from dataclasses import replace
+        db = tmp_path / "empty.db"
+        with Store.open(db) as st:
+            row_no_flags = replace(self._row(), quality_flags=())
+            st.write_frame(self._frame(), [row_no_flags])
+        with sqlite3.connect(db) as conn:
+            (s,) = conn.execute(
+                "SELECT quality_flags FROM stamp_measurements "
+                "WHERE frame_number=10 AND sutr_number=5 AND stamp_id=0"
+            ).fetchone()
+            assert json.loads(s) == []
+
+    def test_signal_snr_null_round_trip(self, tmp_path: Path):
+        # signal_snr=None must round-trip as SQL NULL, not 0.0 or empty.
+        from dataclasses import replace
+        db = tmp_path / "nullsnr.db"
+        with Store.open(db) as st:
+            row_null = replace(self._row(), signal_snr=None)
+            st.write_frame(self._frame(), [row_null])
+        with sqlite3.connect(db) as conn:
+            (s,) = conn.execute(
+                "SELECT signal_snr FROM stamp_measurements "
+                "WHERE frame_number=10 AND sutr_number=5 AND stamp_id=0"
+            ).fetchone()
+            assert s is None
 
     def test_write_frame_with_two_stamps(self, tmp_path: Path):
         db = tmp_path / "two.db"
