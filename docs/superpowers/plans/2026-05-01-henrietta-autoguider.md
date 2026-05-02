@@ -1430,13 +1430,15 @@ class TestStamp:
         assert s.y_hi == 1980
 
     def test_xmin_xmax_helpers(self):
+        # ALGORITHM.md uses [x_center - halfw : x_center + halfw + 1]
+        # -> width = 2*halfw + 1, inclusive of x_center+halfw.
         s = Stamp(x_center=100, x_halfwidth=10, y_lo=0, y_hi=100)
         assert s.x_min == 90
-        assert s.x_max == 110  # half-open: [x_min, x_max)
+        assert s.x_max == 111  # half-open: [90, 111) -> 21 columns
 
     def test_shape(self):
         s = Stamp(x_center=100, x_halfwidth=10, y_lo=200, y_hi=300)
-        assert s.shape == (100, 20)  # (ny, nx)
+        assert s.shape == (100, 21)  # (ny, 2*halfw + 1)
 
     def test_frozen(self):
         s = Stamp(x_center=0, x_halfwidth=1, y_lo=0, y_hi=1)
@@ -1505,11 +1507,13 @@ class Stamp:
 
     @property
     def x_max(self) -> int:
-        return self.x_center + self.x_halfwidth
+        # ALGORITHM.md uses [x_center - halfw : x_center + halfw + 1] —
+        # the +1 gives a 2*halfw+1-wide window inclusive of x_center+halfw.
+        return self.x_center + self.x_halfwidth + 1
 
     @property
     def shape(self) -> tuple[int, int]:
-        """Returns (ny, nx)."""
+        """Returns (ny, nx) where nx = 2*x_halfwidth + 1."""
         return (self.y_hi - self.y_lo, self.x_max - self.x_min)
 ```
 
@@ -2065,7 +2069,14 @@ class FrameBuffer:
         sutr_number: int,
         read: np.ndarray,
     ) -> np.ndarray | None:
-        """Add one SUTR read; return a guide image if one is emitted, else None."""
+        """Add one SUTR read; return a guide image if one is emitted, else None.
+
+        Stride semantics: once the buffer holds 2*K reads, an emit is
+        produced every `stride` reads (not every `stride` newest reads).
+        With K=1 / stride=1 — the default — every SUTR after the first
+        emits a difference. With K=2 / stride=2, emits happen on reads
+        4, 6, 8, … (4 = first warm-up, then every-other).
+        """
         if frame_number != self._current_frame:
             # New integration -> reset.
             self._buf.clear()
@@ -2190,15 +2201,17 @@ Expected: import error.
 ```python
 """Per-row local sky subtraction for stamps.
 
-For each row of the stamp, the sky pedestal is the median of the
-outer 1/6 of pixels on each side (combined). Bad pixels (good == False
-in the mask) are excluded from the median. The pedestal is subtracted
+For each row of the stamp, the sky pedestal is the median of the outer
+1/6 of pixels on **each** side (so 1/6 left + 1/6 right = 1/3 total
+sampled per row), pooled into one value. Bad pixels (good == False in
+the mask) are excluded from the median. The pedestal is subtracted
 from every column in that row.
 
-This removes detector pedestal differences between reads, sky-background
-gradients along the trace, and slow per-frame H2RG bias drift — all of
-which would otherwise bias the cross-correlation peak away from the
-structure that carries position information.
+This matches ALGORITHM.md's sky step (`edge = sub.shape[1] // 6` then
+both bands). It removes detector pedestal differences between reads,
+sky-background gradients along the trace, and slow per-frame H2RG bias
+drift — all of which would otherwise bias the cross-correlation peak
+away from the structure that carries position information.
 """
 
 from __future__ import annotations
@@ -2308,22 +2321,24 @@ class TestXcor2D:
         assert result.dy_px == pytest.approx(-5.0, abs=0.05)
 
     def test_subpixel_x_shift_recovered(self):
-        # 0.4 px X-shift implemented via Fourier shift (cleaner than
-        # any pixel-domain interpolation for testing sub-pixel
-        # recovery).
+        # 0.4 px X-shift via cubic spline. Tolerance is 0.10 px to
+        # accommodate the combined bias of (cubic interpolation ~ a few
+        # 0.01 px) + (parabolic-peak fit on a ~Gaussian xcor surface ~
+        # a few 0.01 px). A real on-sky test will tighten this once we
+        # know the actual point-spread function.
         template = _gaussian_trace()
         from scipy.ndimage import shift as scipy_shift
         data = scipy_shift(template, (0.0, 0.4), order=3, mode="reflect")
         result = xcor_2d(data, template, search=12)
-        assert result.dx_px == pytest.approx(0.4, abs=0.05)
-        assert result.dy_px == pytest.approx(0.0, abs=0.05)
+        assert result.dx_px == pytest.approx(0.4, abs=0.10)
+        assert result.dy_px == pytest.approx(0.0, abs=0.10)
 
     def test_subpixel_y_shift_recovered(self):
         from scipy.ndimage import shift as scipy_shift
         template = _gaussian_trace()
         data = scipy_shift(template, (0.25, 0.0), order=3, mode="reflect")
         result = xcor_2d(data, template, search=12)
-        assert result.dy_px == pytest.approx(0.25, abs=0.05)
+        assert result.dy_px == pytest.approx(0.25, abs=0.10)
 
     def test_curvature_positive_at_peak(self):
         template = _gaussian_trace()
@@ -2390,7 +2405,15 @@ def xcor_2d(
     template: np.ndarray,
     search: int = 12,
 ) -> XcorResult:
-    """Brute-force 2-D xcor with parabolic sub-pixel peak."""
+    """Brute-force 2-D xcor with parabolic sub-pixel peak.
+
+    Sign convention: returns the (dx, dy) such that
+    ``data ≈ np.roll(template, (dy, dx))``. So a positive dx means the
+    data is shifted to the +X direction relative to the template, and
+    the integer-shift unit test ``data = np.roll(template, dx=+3, axis=1)``
+    recovers ``dx_px ≈ +3``. Downstream geometry.py negates this to
+    produce the telescope correction.
+    """
     if data.shape != template.shape:
         raise ValueError(f"shape mismatch: {data.shape} vs {template.shape}")
 
@@ -2521,7 +2544,8 @@ class TestBuildTemplate:
         good = np.ones((2048, 2048), dtype=bool)
         tmpl = build_template(p, self._stamp(), good)
         assert tmpl.frame_number == 42
-        assert tmpl.image.shape == (1380, 50)  # (y_hi-y_lo, 2*halfwidth)
+        # (y_hi-y_lo, 2*halfwidth + 1) per ALGORITHM.md.
+        assert tmpl.image.shape == (1380, 51)
         # Sky should be subtracted: median of off-trace pixels ~ 0.
         offtrace = tmpl.image[:, :15]  # leftmost 15 cols (sky band)
         assert abs(np.median(offtrace)) < 5.0
@@ -2534,8 +2558,10 @@ class TestBuildTemplate:
         assert tmpl.frame_number == 1764
 
     def test_missing_file_raises(self, tmp_path: Path):
+        # Use a filename that PASSES the henNNNN.fits regex so the open
+        # is what fails (not the regex check).
         with pytest.raises(TemplateBuildError, match="open"):
-            build_template(tmp_path / "no.fits", self._stamp(),
+            build_template(tmp_path / "hen9999.fits", self._stamp(),
                            np.ones((2048, 2048), dtype=bool))
 
     def test_too_few_unmasked_raises(self, tmp_path: Path):
