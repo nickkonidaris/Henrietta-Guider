@@ -31,12 +31,12 @@ from textual.containers import Horizontal, Vertical
 from textual.widget import Widget
 from textual.widgets import Footer, Header
 
-from henrietta_guider.core.config import Config, load_config  # noqa: F401
+from henrietta_guider.core.config import Config, load_config
 from henrietta_guider.core.types import GuidingState
 from henrietta_guider.core.worker import Worker
-from henrietta_guider.tui.estimate_k_dialog import EstimateKDialog  # noqa: F401
+from henrietta_guider.tui.estimate_k_dialog import EstimateKDialog
 from henrietta_guider.tui.image_window import ImageWindow
-from henrietta_guider.tui.settings_dialog import SettingsDialog  # noqa: F401
+from henrietta_guider.tui.settings_dialog import SettingsDialog
 from henrietta_guider.tui.widgets.alerts import AlertBanner
 from henrietta_guider.tui.widgets.control_panel import ControlPanel
 from henrietta_guider.tui.widgets.snr_histogram import SnrHistogram
@@ -122,6 +122,7 @@ class HenriettaApp(App):
         *,
         demo: bool = False,
         config_path: str | None = None,
+        cfg: Config | None = None,
         runtime: AutoguiderRuntime | None = None,
     ) -> None:
         super().__init__()
@@ -131,6 +132,7 @@ class HenriettaApp(App):
         self._latest_rotation: float | None = None
         self._demo = demo
         self._config_path = config_path
+        self.cfg = cfg
         self._runtime = runtime
         self._server_status: str | None = None
         self._control_panel = ControlPanel()
@@ -305,14 +307,88 @@ class HenriettaApp(App):
         # TODO(commissioning): notify worker to (re)build template.
 
     def action_estimate_k(self) -> None:
-        # TODO(commissioning): push EstimateKDialog when the worker has
-        # an active template + gain/read-noise pair to feed it.
-        pass
+        """Push the Estimate K modal. Uses the worker's active template
+        when available; falls back to a synthetic Gaussian-column
+        template in --demo mode so the dialog is exercisable without a
+        live pipeline."""
+        template = self._active_template_or_demo()
+        if template is None:
+            log.warning("Estimate K: no active template (waiting on a slope frame).")
+            return
+        cfg = self._ensure_cfg()
+
+        def on_apply(k: int) -> None:
+            log.info("Estimate K: recommended K=%d (operator applied).", k)
+            # TODO(commissioning): push K into the running worker via
+            # a Worker.update_K(K) once that helper exists.
+
+        self.push_screen(
+            EstimateKDialog(
+                template=template,
+                gain_e_per_dn=cfg.detector.gain_e_per_dn,
+                read_noise_e=cfg.detector.read_noise_e,
+                on_apply=on_apply,
+                # 50 realisations × 5 K values is ~3 s on a desktop;
+                # reduce in demo so it returns near-instantly.
+                n_realisations=20 if self._demo else 50,
+            )
+        )
 
     def action_settings(self) -> None:
-        # TODO(commissioning): push SettingsDialog with the current
-        # config + a save_path; reload on save.
-        pass
+        """Push the tabbed Settings modal. Saving persists TOML; loop /
+        quality / reduction edits do not hot-reload (v1 limitation —
+        operator restarts the autoguider)."""
+        cfg = self._ensure_cfg()
+        from pathlib import Path
+
+        save_path = Path(self._config_path or "~/.config/henrietta_guider/config.toml").expanduser()
+
+        def on_saved(new_cfg: Config) -> None:
+            self.cfg = new_cfg
+            log.info("Settings: saved to %s", save_path)
+
+        self.push_screen(SettingsDialog(cfg=cfg, save_path=save_path, on_saved=on_saved))
+
+    def _ensure_cfg(self) -> Config:
+        """Load config lazily if the App was constructed without one
+        (older test paths). Cached on self.cfg."""
+        if self.cfg is None:
+            self.cfg = load_config(self._config_path or "~/.config/henrietta_guider/config.toml")
+        return self.cfg
+
+    def _active_template_or_demo(self):
+        """Return the worker's active template, or — in --demo mode —
+        a synthesized Gaussian-column template so Estimate K renders.
+        Returns None when no template is available and we're not in
+        demo mode (operator must wait for a slope frame)."""
+        if self.worker is not None and self.worker._template is not None:
+            return self.worker._template
+        if not self._demo:
+            return None
+        # Build a small synthetic template once, cache it.
+        cached = getattr(self, "_demo_template", None)
+        if cached is not None:
+            return cached
+        import numpy as np
+
+        from henrietta_guider.core.template import Template
+        from henrietta_guider.core.types import Stamp
+
+        ny, nx = 200, 51
+        sigma = 1.5
+        x = np.arange(nx)[None, :].astype(np.float32)
+        img = (1000.0 * np.exp(-((x - nx // 2) ** 2) / (2 * sigma**2))) * np.ones(
+            (ny, 1), dtype=np.float32
+        )
+        good = np.ones(img.shape, dtype=bool)
+        cached = Template(
+            image=img.astype(np.float32),
+            good=good,
+            frame_number=0,
+            stamp=Stamp(x_center=nx // 2, x_halfwidth=nx // 2, y_lo=0, y_hi=ny),
+        )
+        self._demo_template = cached
+        return cached
 
     def action_toggle_image(self) -> None:
         # TODO(commissioning): show / hide the matplotlib side-window.
@@ -396,6 +472,7 @@ def main() -> int:
         runtime.start()
     try:
         app = HenriettaApp(
+            cfg=cfg,
             demo=args.demo,
             runtime=runtime,
             config_path=args.config,
