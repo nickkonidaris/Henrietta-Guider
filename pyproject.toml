@@ -47,6 +47,7 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py314"
+extend-exclude = ["mockups/", "experiments/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "C4", "SIM", "TID"]
