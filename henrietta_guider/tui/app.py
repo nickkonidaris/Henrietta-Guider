@@ -248,6 +248,11 @@ class HenriettaApp(App):
             sci.xcor_peak_value,
             rotation_deg=self._latest_rotation,
         )
+        self._control_panel.update_command(
+            getattr(evt, "cmd_ra_arcsec", None),
+            getattr(evt, "cmd_dec_arcsec", None),
+            getattr(evt, "cmd_suppressed_by", None),
+        )
         if evt.state is not self.state:
             prev = self.state
             self.state = evt.state

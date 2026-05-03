@@ -291,6 +291,16 @@ class Worker:
             # Step controllers / send command. Suppression reasons are
             # tracked distinctly per spec §7 schema.
             cmd_ra, cmd_dec, suppressed = self._step_controllers(sci)
+            if suppressed and suppressed != "alerted":
+                # `alerted` is already loud (state transition logged
+                # above); the others are quieter and the operator may
+                # be wondering why no G-frames are flowing.
+                log.info(
+                    "cmd suppressed: %s (dx=%s dy=%s)",
+                    suppressed,
+                    f"{sci.dx_px:+.3f}" if sci.dx_px is not None else "--",
+                    f"{sci.dy_px:+.3f}" if sci.dy_px is not None else "--",
+                )
 
             # Field rotation (derived). When both science (id=0) and
             # rotation (id=2) stamps produced an xcor measurement on

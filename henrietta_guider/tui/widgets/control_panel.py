@@ -45,6 +45,7 @@ class ControlPanel(Widget):
     ControlPanel { width: 40; padding: 1; }
     ControlPanel #status   { color: #93C5FD; }
     ControlPanel #readouts { color: #E5E7EB; }
+    ControlPanel #cmd      { color: #FBBF24; }
     """
 
     def __init__(self) -> None:
@@ -52,6 +53,7 @@ class ControlPanel(Widget):
         self._status = Static("status: idle", id="status")
         self._template = Static("template: none", id="template")
         self._readouts = Static("dx --  dy --  fwhm --  xcor --", id="readouts")
+        self._cmd = Static("cmd: --", id="cmd")
         self._btn_build = Button("Build Template", id="build")
         self._btn_start = Button("Start", id="start")
         self._btn_stop = Button("Stop", id="stop")
@@ -71,6 +73,7 @@ class ControlPanel(Widget):
             self._btn_pause,
             Static("─── Live ───"),
             self._readouts,
+            self._cmd,
             Static("─── Tools ───"),
             Static("[k] Estimate K   [,] Settings"),
         )
@@ -92,6 +95,26 @@ class ControlPanel(Widget):
         if rotation_deg is not None:
             line += f"  rot {rotation_deg:+.4f}°"
         self._readouts.update(line)
+
+    def update_command(
+        self,
+        cmd_ra: float | None,
+        cmd_dec: float | None,
+        suppressed_by: str | None,
+    ) -> None:
+        """Reflect the latest controller decision.
+
+        ``suppressed_by`` is one of ``"deadband" | "pacing" | "alerted" |
+        "tcs_disconnected" | None`` (None means a real send happened).
+        """
+        if cmd_ra is None or cmd_dec is None:
+            self._cmd.update("cmd: -- (warming up)")
+            return
+        head = f'cmd: RA{cmd_ra:+.3f}" Dec{cmd_dec:+.3f}"'
+        if suppressed_by:
+            self._cmd.update(f"{head}  [suppressed: {suppressed_by}]")
+        else:
+            self._cmd.update(f"{head}  [sent]")
 
     def update_template_label(self, frame_number: int | None) -> None:
         if frame_number is None:
