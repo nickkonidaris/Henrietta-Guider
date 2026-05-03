@@ -62,6 +62,26 @@ def _group_test_frames(test_dir: Path) -> dict[int, dict]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="drip_test_frames")
     parser.add_argument("--watch-dir", required=True, type=Path)
+    parser.add_argument(
+        "--source-dir",
+        type=Path,
+        default=TEST_DIR,
+        help="directory of source FITS frames (default: repo's test/)",
+    )
+    parser.add_argument(
+        "--frames",
+        nargs=2,
+        type=int,
+        metavar=("LO", "HI"),
+        default=None,
+        help="inclusive source-frame range, e.g. --frames 3419 3447",
+    )
+    parser.add_argument(
+        "--source-frame",
+        type=int,
+        default=None,
+        help="only replay this one source frame (default: cycle through all)",
+    )
     parser.add_argument("--start-frame", type=int, default=2000, help="first target frame number")
     parser.add_argument(
         "--inter-sutr-s",
@@ -76,12 +96,6 @@ def main(argv: list[str] | None = None) -> int:
         help="seconds between successive frames",
     )
     parser.add_argument(
-        "--source-frame",
-        type=int,
-        default=None,
-        help="only replay this one source frame from test/ (default: cycle through all available)",
-    )
-    parser.add_argument(
         "--max-frames",
         type=int,
         default=0,
@@ -91,21 +105,30 @@ def main(argv: list[str] | None = None) -> int:
 
     args.watch_dir.mkdir(parents=True, exist_ok=True)
 
-    by_frame = _group_test_frames(TEST_DIR)
+    by_frame = _group_test_frames(args.source_dir)
     if not by_frame:
-        parser.error(f"no FITS files found in {TEST_DIR}")
+        parser.error(f"no FITS files found in {args.source_dir}")
 
+    if args.source_frame is not None and args.frames is not None:
+        parser.error("--source-frame and --frames are mutually exclusive")
     if args.source_frame is not None:
         if args.source_frame not in by_frame:
             parser.error(
-                f"source frame {args.source_frame} not in {TEST_DIR}; available: {sorted(by_frame)}"
+                f"source frame {args.source_frame} not in {args.source_dir}; "
+                f"available: {sorted(by_frame)[:6]}…"
             )
         sources = [args.source_frame]
+    elif args.frames is not None:
+        lo, hi = args.frames
+        sources = [f for f in sorted(by_frame) if lo <= f <= hi]
+        if not sources:
+            parser.error(f"no frames in range [{lo}, {hi}] under {args.source_dir}")
     else:
         sources = sorted(by_frame)
 
     print(f"Drip into : {args.watch_dir}")
-    print(f"Sources   : hen{sources!r}")
+    print(f"Source dir: {args.source_dir}")
+    print(f"Sources   : {len(sources)} frames hen{sources[0]:04d}..hen{sources[-1]:04d}")
     print(f"Target    : starting at frame {args.start_frame:04d}")
     print(f"Cadence   : {args.inter_sutr_s}s/SUTR, {args.inter_frame_s}s/frame")
     print()
