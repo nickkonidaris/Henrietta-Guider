@@ -269,8 +269,6 @@ class HenriettaApp(App):
             sci.dx_px,
             sci.dy_px,
             sci.trace_fwhm_x_px,
-            sci.xcor_peak_value,
-            rotation_deg=self._latest_rotation,
         )
         # Same xcor measurement, projected onto the sky frame using
         # cfg.tcs.* — what the controller actually acts on.

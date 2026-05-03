@@ -91,16 +91,15 @@ class ControlPanel(Widget):
         dx: float | None,
         dy: float | None,
         fwhm: float | None,
-        xcor_peak: float | None,
-        rotation_deg: float | None = None,
     ) -> None:
+        # xcor peak and rotation are already on the plots; keep this
+        # line tight so the panel doesn't wrap.
         def f2(x: float | None) -> str:
             return f"{x:+.2f}" if x is not None else "  --"
 
-        line = f"dx {f2(dx)}px  dy {f2(dy)}px  fwhm {f2(fwhm)}px  xcor {f2(xcor_peak)}"
-        if rotation_deg is not None:
-            line += f"  rot {rotation_deg:+.4f}°"
-        self._readouts.update(line)
+        self._readouts.update(
+            f"dx {f2(dx)}px  dy {f2(dy)}px  fwhm {f2(fwhm)}px"
+        )
 
     def update_sky(
         self,
