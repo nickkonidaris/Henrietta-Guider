@@ -106,7 +106,15 @@ class ControlPanel(Widget):
 
         ``suppressed_by`` is one of ``"deadband" | "pacing" | "alerted" |
         "tcs_disconnected" | None`` (None means a real send happened).
+        ``cmd_ra``/``cmd_dec`` are None during framebuffer warmup OR when
+        suppressed by a non-deadband reason.
         """
+        if suppressed_by == "alerted":
+            self._cmd.update("cmd: -- (alerted by quality monitor)")
+            return
+        if suppressed_by == "tcs_disconnected":
+            self._cmd.update("cmd: -- (TCS disconnected)")
+            return
         if cmd_ra is None or cmd_dec is None:
             self._cmd.update("cmd: -- (warming up)")
             return
@@ -116,11 +124,12 @@ class ControlPanel(Widget):
         else:
             self._cmd.update(f"{head}  [sent]")
 
-    def update_template_label(self, frame_number: int | None) -> None:
+    def update_template_label(self, frame_number: int | None, k: int | None = None) -> None:
+        suffix = f"  K={k}" if k is not None else ""
         if frame_number is None:
-            self._template.update("template: none")
+            self._template.update(f"template: none{suffix}")
         else:
-            self._template.update(f"template: hen{frame_number:04d}")
+            self._template.update(f"template: hen{frame_number:04d}{suffix}")
 
     def update_buttons_for_state(self, state: GuidingState) -> None:
         m = buttons_for_state(state)

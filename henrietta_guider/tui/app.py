@@ -253,6 +253,12 @@ class HenriettaApp(App):
             getattr(evt, "cmd_dec_arcsec", None),
             getattr(evt, "cmd_suppressed_by", None),
         )
+        # Show the active template's frame number + K so the operator
+        # can see whether reduction is actually configured / running.
+        cfg_k = self.cfg.reduction.K if self.cfg is not None else None
+        self._control_panel.update_template_label(
+            getattr(sci, "template_frame_number", None), k=cfg_k
+        )
         if evt.state is not self.state:
             prev = self.state
             self.state = evt.state
