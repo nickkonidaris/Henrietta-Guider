@@ -43,6 +43,7 @@ from henrietta_guider.tui.command_prompt import (
     CommandHelp,
     CommandPrompt,
     ParseError,
+    SetPa,
     SetStamp,
     ShowHelp,
     parse_command,
@@ -174,10 +175,14 @@ class HenriettaApp(App):
             TimeSeries("dx (px)", lambda r: r.dx_px, ylim=(-2.5, 2.5)),
             TimeSeries("dy (px)", lambda r: r.dy_px, ylim=(-2.5, 2.5)),
             TimeSeries("fwhm (px)", lambda r: r.trace_fwhm_x_px),
-            TimeSeries("flux (ADU)", lambda r: r.trace_flux_adu),
-            TimeSeries("sky bg (ADU)", lambda r: r.sky_background_adu),
+            TimeSeries("flux (ADU)", lambda r: r.trace_flux_adu, ylim=(0, None)),
+            TimeSeries("sky bg (ADU)", lambda r: r.sky_background_adu, ylim=(0, None)),
             TimeSeries("xcor peak", lambda r: r.xcor_peak_value),
-            TimeSeries("rotation (deg)", lambda r: self._latest_rotation),
+            TimeSeries(
+                "rotation (deg)",
+                lambda r: self._latest_rotation,
+                ylim=(-0.3, 0.3),
+            ),
         ]
         # SNR is a histogram of the per-frame integrated SNR scalar
         # (sqrt(total_e) over the science stamp), accumulated over a
@@ -508,9 +513,7 @@ class HenriettaApp(App):
                 return  # ESC
             stripped = value.strip()
             # Avoid back-to-back duplicates; trim to HISTORY_MAX.
-            if stripped and (
-                not self._command_history or self._command_history[-1] != stripped
-            ):
+            if stripped and (not self._command_history or self._command_history[-1] != stripped):
                 self._command_history.append(stripped)
                 self._command_history = self._command_history[-HISTORY_MAX:]
                 self._save_command_history()
@@ -531,6 +534,9 @@ class HenriettaApp(App):
             return
         if isinstance(result, ShowHelp):
             self.push_screen(CommandHelp())
+            return
+        if isinstance(result, SetPa):
+            self._handle_set_pa(result.deg)
             return
         if isinstance(result, ClearStamps):
             if result.n is None:
@@ -584,6 +590,28 @@ class HenriettaApp(App):
                 f"y∈[{result.y_lo},{result.y_hi})",
                 severity="information",
             )
+
+    def _handle_set_pa(self, deg: float) -> None:
+        """Update the configured PA. The worker reads cfg.tcs at every
+        SUTR, so a live mutation takes effect on the next correction."""
+        cfg = self._ensure_cfg()
+        cfg.tcs.pa_convention_offset_deg = deg
+        # Persist so a restart picks up the same PA.
+        from pathlib import Path as _Path
+
+        from henrietta_guider.core.config import save_config
+
+        save_path = _Path(
+            self._config_path or "~/.config/henrietta_guider/config.toml"
+        ).expanduser()
+        try:
+            save_config(cfg, save_path)
+        except OSError as exc:
+            log.warning("could not persist PA to %s: %s", save_path, exc)
+        self.notify(
+            f"PA set to {deg:+.2f}° (detector +X = +Dec, +Y = +RA at PA=0)",
+            severity="information",
+        )
 
     def _push_stamps_to_image(self) -> None:
         if self.image_window is None or not self.image_window.available:

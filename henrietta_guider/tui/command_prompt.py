@@ -57,6 +57,13 @@ class ClearStamps:
 
 
 @dataclass(frozen=True)
+class SetPa:
+    """Result of `:pa <deg>` — sky-frame position angle in degrees."""
+
+    deg: float
+
+
+@dataclass(frozen=True)
 class ShowHelp:
     """Result of `:?`."""
 
@@ -69,7 +76,9 @@ class ParseError:
     message: str
 
 
-def parse_command(text: str) -> SetStamp | ClearStamps | ShowHelp | ParseError:
+def parse_command(
+    text: str,
+) -> SetStamp | ClearStamps | SetPa | ShowHelp | ParseError:
     """Parse a typed command string (no leading colon).
 
     Whitespace and commas are interchangeable. Empty input is treated
@@ -91,6 +100,15 @@ def parse_command(text: str) -> SetStamp | ClearStamps | ShowHelp | ParseError:
         if n not in STAMP_LABELS:
             return ParseError(f"`clear N`: N must be 1, 2, or 3 (got {n})")
         return ClearStamps(n=n)
+    if s.startswith("pa"):
+        rest = s[len("pa") :].strip()
+        if not rest:
+            return ParseError("`pa` needs an angle in degrees, e.g. `:pa 35`")
+        try:
+            deg = float(rest)
+        except ValueError:
+            return ParseError(f"`pa` takes a number of degrees (got `{rest}`)")
+        return SetPa(deg=deg)
     parts = s.replace(",", " ").split()
     if len(parts) != 5:
         return ParseError(f"expected `N x_min y_lo x_max y_hi` (5 values) — got {len(parts)}")
@@ -233,6 +251,10 @@ class CommandHelp(ModalScreen):
             yield Static(":clear                        clear all stamps", classes="row")
             yield Static(
                 ":clear N                      clear stamp N (1/2/3)",
+                classes="row",
+            )
+            yield Static(
+                ":pa <deg>                     set position angle (sky frame)",
                 classes="row",
             )
             yield Static(":?                            this help", classes="row")

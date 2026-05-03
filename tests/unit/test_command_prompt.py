@@ -3,6 +3,7 @@ import pytest
 from henrietta_guider.tui.command_prompt import (
     ClearStamps,
     ParseError,
+    SetPa,
     SetStamp,
     ShowHelp,
     parse_command,
@@ -43,6 +44,22 @@ class TestCommandParser:
 
     def test_clear_bad_arg(self):
         assert isinstance(parse_command("clear foo"), ParseError)
+
+    def test_pa_basic(self):
+        r = parse_command("pa 35")
+        assert isinstance(r, SetPa)
+        assert r.deg == pytest.approx(35.0)
+
+    def test_pa_negative(self):
+        r = parse_command("pa -12.5")
+        assert isinstance(r, SetPa)
+        assert r.deg == pytest.approx(-12.5)
+
+    def test_pa_no_arg(self):
+        assert isinstance(parse_command("pa"), ParseError)
+
+    def test_pa_bad_arg(self):
+        assert isinstance(parse_command("pa abc"), ParseError)
 
     def test_invalid_id(self):
         r = parse_command("9 1 2 3 4")

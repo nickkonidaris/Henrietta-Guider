@@ -33,13 +33,16 @@ class TimeSeries(Widget):
         title: str,
         getter: Callable,  # row -> float | None
         window_s: float = 100.0,
-        ylim: tuple[float, float] | None = None,
+        ylim: tuple[float | None, float | None] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.title = title
         self.getter = getter
         self.window_s = window_s
+        # ylim entries can be None to indicate "autoscale that end" —
+        # e.g. ylim=(0, None) anchors the bottom at 0 and lets the top
+        # follow the buffer's max.
         self.ylim = ylim
         # Each entry is (monotonic-time, value-or-None). Trimmed each
         # append so we never hold more than ~window_s seconds of data.
@@ -66,14 +69,24 @@ class TimeSeries(Widget):
         plt.frame(False)
         plt.title(self.title)
         plt.plotsize(self.size.width, self.size.height)
-        if self.ylim is not None:
-            plt.ylim(self.ylim[0], self.ylim[1])
         # X = seconds ago (negative on the left, 0 on the right edge).
         # Pinning the X range stops the trace from marching as samples
         # accumulate.
         now = time.monotonic()
         xs = [t - now for t, _ in self.buffer]
         ys = [(v if v is not None else float("nan")) for _, v in self.buffer]
+        if self.ylim is not None:
+            ymin, ymax = self.ylim
+            if ymin is None or ymax is None:
+                # Autoscale the missing end from the live buffer values.
+                live = [v for v in ys if v == v]  # NaN-filter
+                if live:
+                    if ymin is None:
+                        ymin = min(live)
+                    if ymax is None:
+                        ymax = max(live)
+            if ymin is not None and ymax is not None and ymax > ymin:
+                plt.ylim(ymin, ymax)
         plt.plot(xs, ys)
         plt.xlim(-self.window_s, 0)
         return Text.from_ansi(plt.build())
