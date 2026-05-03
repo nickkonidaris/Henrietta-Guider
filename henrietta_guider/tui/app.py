@@ -256,9 +256,15 @@ class HenriettaApp(App):
         # closure can read it (MeasurementRow is frozen, so we can't
         # decorate sci directly).
         self._latest_rotation = getattr(evt, "field_rotation_deg", None)
-        for ts in self._timeseries:
-            ts.append(sci)
-        self._snr_histogram.append(sci)
+        # Skip plot updates while the framebuffer is in warmup (the
+        # first SUTR of every frame has dx_px=None, signal_snr=None,
+        # etc.). Pushing those would draw NaN gaps that distract more
+        # than they inform; the cmd readout below still shows
+        # "(warming up)" so the operator sees something happened.
+        if sci.dx_px is not None:
+            for ts in self._timeseries:
+                ts.append(sci)
+            self._snr_histogram.append(sci)
         self._control_panel.update_readouts(
             sci.dx_px,
             sci.dy_px,
