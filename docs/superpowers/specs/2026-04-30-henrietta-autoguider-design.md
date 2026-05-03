@@ -23,8 +23,8 @@ non-periodic mount errors.
 - Reading SUTR FITS frames as they appear on disk and computing per-frame
   trace measurements.
 - Closed-loop fine guiding (per-axis P controller, with hooks for PI/PID).
-- A Tk + ttk + matplotlib operator GUI for stamp / template setup,
-  live image + plot display, and alerts.
+- A `textual` + `plotext` TUI for stamp/template setup, controls, time-series plots, histograms, and alerts.
+- A separate `matplotlib` window for the live image (full-resolution, ZScale stretch, draggable stamp ROIs, navigation-toolbar zoom).
 - A SQLite archive of every measurement.
 - A "headless" CLI for batch / scripted runs.
 - Configuration with deterministic, reproducible Python environment via `uv`.
@@ -39,8 +39,8 @@ non-periodic mount errors.
 - A dedicated cosmic-ray rejection algorithm (medianing throughout the
   pipeline + the bad-pixel mask are sufficient — see §11).
 - Online updates to the bad-pixel mask (loaded once at startup).
-- High-refresh-rate live image display (loop runs at ≤ ~0.5 Hz; Tk + matplotlib
-  is sized for that).
+- High-refresh-rate live image display (loop runs at ≤ ~0.5 Hz; the
+  matplotlib side window is sized for that).
 
 ## 2. System overview
 
@@ -53,12 +53,12 @@ note the directories here are notional:
 └──────────────────────────┘                  │ on_created/on_modified
                                               │ + 0.2 s settle timer
                                               ▼
-                                   ┌────────────────────────┐
-                                   │  henrietta_guider/core │
-                                   │   watcher → measure →  │
-                                   │   control → tcs_client │
-                                   │   → store              │
-                                   └──┬─────────────────┬───┘
+                                   ┌──────────────────────────────┐
+                                   │  henrietta_guider/core       │
+                                   │   watcher → measure →        │
+                                   │   control → autoguider_server│
+                                   │   → store                    │
+                                   └──┬───────────────────────┬───┘
                                       │ G xx yy CR      │ rows
                                       ▼                 ▼
                                 ┌──────────┐    ┌──────────────────┐
@@ -66,9 +66,10 @@ note the directories here are notional:
                                 │ (TCP)    │    │   .db (SQLite)   │
                                 └──────────┘    └──────────────────┘
 
-                              GUI (Tk + ttk + matplotlib)
-                                imports core, runs in same
-                                process; displays live image,
+                              TUI (textual + plotext)
+                              + matplotlib image side-window
+                                import core, run in same
+                                process; display live image,
                                 plots, alerts, controls.
 ```
 
@@ -102,32 +103,40 @@ henrietta_guider/
 │   │                          2-D xcor against template, sub-pixel peak,
 │   │                          FWHM, flux
 │   ├── controller.py          P (PI/PID hooks), dead band, max clip
-│   ├── tcs_client.py          TCP socket, G-command encoder, pacing
+│   ├── autoguider_server.py    TCP socket, G-command encoder, pacing
 │   ├── store.py               SQLite (frames + stamp_measurements tables)
 │   ├── geometry.py            detector → sky transform (plate scale, PA)
 │   ├── monte_carlo.py         "Estimate K" simulator
 │   └── config.py              dataclass schema, TOML load/save
 ├── cli/
 │   └── __main__.py            python -m henrietta_guider.cli ...
-├── gui/
-│   └── app.py                 Tk + ttk + matplotlib operator GUI
+├── tui/
+│   ├── __init__.py
+│   ├── app.py                    textual main app (status, controls, plots, alerts)
+│   ├── widgets/                  reusable textual widgets (time-series via plotext,
+│   │                             histogram via plotext, control panel, etc.)
+│   ├── image_window.py           matplotlib side-window (live image + ROIs + zoom)
+│   └── audio.py                  audio-event dispatch (alerts.py replaced)
 └── tests/
     ├── unit/
     └── integration/
 ```
 
-`core/` has zero dependencies on `gui/` or any GUI library. CLI and GUI are
-both thin frontends over the same core.
+`core/` has zero dependencies on `tui/` or any UI library. CLI and TUI
+are both thin frontends over the same core.
 
 ### Concurrency
 
-- **Main thread**: Tk + matplotlib event loop. Drains a thread-safe
-  `queue.Queue[Measurement]` every 200 ms via `root.after()` and updates
-  widgets / plots.
-- **Worker thread** (single): runs the file watcher, reduction, centroid,
-  controller, and TCS sender end-to-end. Pushes `Measurement` events onto the
-  queue.
-- No async, no multiprocessing. At ≤1 Hz with mostly-I/O work, threading
+- **Main thread**: textual asyncio loop. Drains a thread-safe
+  `queue.Queue[Measurement]` every 200 ms via a textual `set_interval`
+  callback and updates widgets.
+- **Image thread**: matplotlib `TkAgg` runs its own `mainloop` on a side
+  thread; consumes from a separate image-frame queue; not coupled to the
+  textual layout.
+- **Worker thread**: unchanged — still owns watcher → reducer →
+  controller → autoguider_server → store, and pushes events to both
+  queues.
+- No multiprocessing. At ≤1 Hz with mostly-I/O work, threading
   is sufficient and dramatically simpler.
 
 ### Tooling and reproducibility
@@ -137,7 +146,9 @@ both thin frontends over the same core.
 - **uv** manages the Python interpreter (downloads `python-build-standalone`),
   the venv, and the lockfile. `uv.lock` is committed to git.
 - stdlib `dataclasses` + `tomllib` for config (no pydantic).
-- `Tk + ttk + matplotlib` for GUI. `aqua` theme on macOS; `clam` on Linux.
+- `textual` + `plotext` for the TUI; `matplotlib` (TkAgg backend) for the
+  live image window only. The TUI handles terminal-size changes natively
+  (SIGWINCH via textual).
 - `astropy` (FITS), `numpy`, `scipy`, `watchdog`.
 - Dev: `pytest`, `ruff`. CI: GitHub Actions running `uv sync && make test &&
   make lint`.
@@ -286,7 +297,7 @@ might also just be the operator updating a metadata label without
 actually slewing. So this is treated as a **soft warning**:
 
 - A `WARN`-level (yellow) banner: "OBJECT changed: %s → %s — verify"
-- A brief beep (Tk's `widget.bell()` — the system tink, not the louder
+- A brief terminal bell (`\a` — the system tink, not the louder
   warning sound). No spoken phrase.
 - A log line at `WARNING`.
 - **Guiding continues**; no state transition.
@@ -351,9 +362,11 @@ downstream measurements ignore masked pixels.
 ### Stamp geometry
 
 Each frame is processed inside small rectangular **stamps**, not the full
-detector. Up to two per session:
+detector. Up to 3 stamps per session: 1 science (required), 1 comparison
+(optional, diagnostic), 1 **rotation** (optional, diagnostic — for
+measuring field rotation):
 
-- 1 **science stamp** (required) — covers the bright trace.
+- 1 **science stamp** (required, `stamp_id=0`) — covers the bright trace.
   Parameterised by `(x_center, x_halfwidth, y_lo, y_hi)`. Typical sizes:
   `x_halfwidth ≈ 25 px` (snug around the trace; ±25 covers a 6 px drift
   with margin) and `y_lo..y_hi` spans the whole illuminated stripe
@@ -361,12 +374,50 @@ detector. Up to two per session:
   load-bearing — both Y-axis precision (from filter cutoffs and absorption
   bands) and X-axis precision (from the continuum) come from the full
   vertical extent.
-- 1 **comparison stamp** (optional) — a second region on the spectrum,
-  measured by the same algorithm but **never** drives the control loop.
-  For "is the science stamp positioned well?" diagnostics.
+- 1 **comparison stamp** (optional, `stamp_id=1`) — a second region on
+  the spectrum, measured by the same algorithm but **never** drives the
+  control loop. For "is the science stamp positioned well?" diagnostics.
+- 1 **rotation stamp** (optional, `stamp_id=2`) — a third stamp placed
+  far from the science stamp on the detector. Goes through the same xcor
+  pipeline (its own template). Used purely as a diagnostic to derive a
+  per-frame `field_rotation_deg` (see "Field rotation (derived)" below).
+  **No knob to turn for rotation** — Henrietta has no rotator-correction
+  output — but we measure and log it so the operator can see when field
+  rotation has degraded image quality enough to require manual
+  intervention.
 
-Stamps are drawn or numerically entered in the GUI. Geometries persist
-in `session.toml` so they survive across nights once set up.
+Stamps are drawn or numerically entered in the TUI / image window.
+Geometries persist in `session.toml` so they survive across nights once
+set up.
+
+### Field rotation (derived)
+
+When both a science stamp (id=0) and a rotation stamp (id=2) are
+configured, the worker computes a per-frame `field_rotation_deg` from the
+differential pixel motion of the two stamps:
+
+```
+# vector from science stamp center to rotation stamp center, in detector pixels:
+sx = rotation_stamp.x_center - science_stamp.x_center
+sy = rotation_stamp.y_center - science_stamp.y_center  # approximate Y mid via (y_lo + y_hi) / 2
+d  = sqrt(sx² + sy²)         # detector separation
+φ  = atan2(sy, sx)           # angle of the separation vector
+
+# differential xcor shifts:
+ddx = dx_rot - dx_sci
+ddy = dy_rot - dy_sci
+
+# component perpendicular to the separation vector / d  ≈  rotation angle (rad):
+θ_rad = (ddy * cos(φ) - ddx * sin(φ)) / d
+field_rotation_deg = θ_rad * 180 / π
+```
+
+Stored on the `frames` table per (frame_number, sutr_number); plotted as
+a time series in the TUI; **no controller acts on it** — Henrietta has no
+rotator-correction knob. Operators use the time series to decide when
+field rotation has degraded image quality enough to require manual
+intervention. NULL when the rotation stamp is not configured or when
+either stamp's xcor measurement is None (warming up).
 
 ### Local sky subtraction
 
@@ -651,8 +702,7 @@ range as a defence in depth.
 
 ### Connection lifecycle
 
-`TCSClient` runs its own state machine: `DISCONNECTED → CONNECTING →
-CONNECTED`, with exponential-backoff auto-reconnect on socket drop.
+`AutoGuiderServer` owns a TCP listening socket. Its state machine is `WAITING_FOR_CLIENT → CONNECTED`; if the TCS drops the connection, the server returns to `WAITING_FOR_CLIENT` and accepts the next incoming connection. There is no outbound `connect()` — the TCS is responsible for initiating the link.
 `send_guide()` is non-blocking; returns False if not currently `CONNECTED` or
 within the pacing window. The GUI surfaces the link state and a "commands
 suppressed" counter.
@@ -711,6 +761,7 @@ CREATE TABLE frames (
     cmd_suppressed_by  TEXT,         -- NULL = sent, else 'pacing'|'deadband'|'alerted'|'tcs_disconnected'
     err_ra_arcsec      REAL,
     err_dec_arcsec     REAL,
+    field_rotation_deg REAL,         -- derived from science vs rotation stamp
     guiding_state      TEXT,
     PRIMARY KEY (frame_number, sutr_number)
 );
@@ -718,7 +769,7 @@ CREATE TABLE frames (
 CREATE TABLE stamp_measurements (
     frame_number          INTEGER NOT NULL,
     sutr_number           INTEGER NOT NULL,
-    stamp_id              INTEGER NOT NULL,   -- 0 = science, 1 = comparison
+    stamp_id              INTEGER NOT NULL,   -- 0 = science, 1 = comparison, 2 = rotation
     stamp_x_center        INTEGER,            -- detector pixel
     stamp_x_halfwidth     INTEGER,
     stamp_y_lo            INTEGER,
@@ -792,12 +843,12 @@ Sections: `[loop]`, `[quality]`, `[reduction]`, `[files]`, `[tcs]`,
 - `detector.gain_e_per_dn = 4.0` (placeholder)
 - `detector.read_noise_e = 12.0` (placeholder)
 - `detector.saturation_dn = 40000`
-- `display.image_stretch = "zscale"`, `display.theme_macos = "aqua"`,
-  `display.theme_linux = "clam"`
+- `display.image_stretch = "zscale"` (matplotlib image-window stretch);
+  TUI styling is handled by textual's CSS-like theming (see textual docs).
 - `display.audio_alerts = true`,
   `display.audio_alert_sound = "/System/Library/Sounds/Submarine.aiff"`
-  (overridable to any `.wav`/`.aiff` path, or `null` to use Tk's
-  `widget.bell()` only)
+  (overridable to any `.wav`/`.aiff` path, or `null` to use the
+  terminal bell only)
 - `display.audio_speak_alerts = true` — when an event has a spoken
   phrase associated with it (currently only target-switch detection),
   speak it via the OS speech synthesiser (`say`/`espeak`). Set `false`
@@ -819,126 +870,85 @@ Holds the daily-changing state:
 The active **template** itself is held only in memory and is **not**
 persisted — it must be re-built each session from a fresh `henNNNN.fits`.
 
-## 9. GUI
+## 9. Operator interface (TUI + image window)
 
-Single Tk window, layout:
+### TUI (textual + plotext) — main process
+
+A keyboard-driven terminal application built with [textual](https://textual.textualize.io/). Owns the operator's primary interface: status bar, controls, time-series plots, histogram, alerts, settings, Estimate K dialog. Renders in any modern terminal (Terminal.app, iTerm2, ghostty); supports SSH natively (no X11 forwarding); reflows on terminal resize via SIGWINCH.
+
+**Layout (terminal at recommended ≥40 rows × 160 cols):**
 
 ```
-┌─ status bar ─────────────────────────────────────────────────────────┐
-│ TCS ●  │ Watcher ●  │ State: GUIDING │ Watch dir: /data/... [Change…]│
-├──────────────────────────┬───────────────────────────────────────────┤
-│  matplotlib live image   │  Stamps:   [Draw science] [Add comparison]│
-│   - science stamp (red)  │            [Reset to defaults]            │
-│   - comparison (cyan)    │                                           │
-│   - template thumbnail   │  Stamp geometry (science):                │
-│     overlay (small)      │    x_center:    __________ px             │
-│                          │    x_halfwidth: __________ px             │
-│                          │    y_lo:        __________ px             │
-│                          │    y_hi:        __________ px             │
-│                          │                                           │
-│                          │  Template:  hen0042.fits                  │
-│                          │             [ ] Auto-refresh on new       │
-│                          │                 henNNNN.fits              │
-│                          │             [Build Template]              │
-│                          │                                           │
-│                          │  Loop:     [START]  [STOP]  [PAUSE]       │
-│                          │  Tools:    [Estimate K]  [Settings…]      │
-├──────────────────────────┴───────────────────────────────────────────┤
-│   Time series (scrollable):                                          │
-│     dx_px, dy_px (rejected / paused frames marked)                   │
-│     trace_fwhm_x_px                                                  │
-│     trace_flux_adu       — science (solid), comparison (dashed)      │
-│     sky_background_adu                                               │
-│     xcor_peak_value      — drops on cloud / template mismatch        │
-│     signal_snr           — per-stamp √(Σ DN·gain), one point per     │
-│                            SUTR; rises through each integration and  │
-│                            resets at each new frame_number boundary  │
-│     commands sent (RA, Dec)                                          │
-└──────────────────────────────────────────────────────────────────────┘
+┌─ Status bar ──────────────────────────────────────────────────────────────────┐
+│ TCS ●  Watcher ●  State: GUIDING  Watch dir: /data/2026-04-30  [c]hange        │
+├─ Controls ─────────────────┬─ Time-series (plotext) ─────────────────────────┤
+│ Stamps                     │ dx, dy (px)        ▁▂▂▂▂▂▃▄▅▆▆▆▇▇▇▇█             │
+│   [d] Draw science         │ FWHM (px)          ▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃             │
+│   [a] Add comparison       │ flux (ADU)         ▆▆▆▆▆▆▆▆▆▆▆▆▆▅▅▆▆             │
+│   [r] Add rotation         │ sky bg (ADU)       ▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂             │
+│ Stamp geometry (science)   │ xcor peak          ▇▇▇▇▇▇▇▆▇▇▇▇▇▇▇▇▇             │
+│   x_center:    1024 px     │ signal SNR √e⁻     ▁▂▃▄▅▆▇█▁▂▃▄▅▆▇█▁             │
+│   x_halfwidth:   25 px     │ rotation (deg)     ─~──~─~──~──~──~~             │
+│   y_lo:         360 px     │                                                  │
+│   y_hi:        1990 px     │                                                  │
+│ Template                   ├─ Per-pixel SNR histogram ───────────────────────┤
+│   current: hen0042.fits    │ ▁▂▆█▆▃▂▁                                         │
+│   [ ] Auto-refresh         │ μ=65.1  σ=47.4   median=65.1   p10=12.0          │
+│   [b] Build Template       │                                                  │
+│ Loop                       ├─ Live readouts ─────────────────────────────────┤
+│   [s] START   [t] STOP     │ dx:  +0.04 px   dy:  -0.02 px   FWHM: 3.42 px    │
+│   [p] PAUSE                │ xcor peak: 0.927   signal SNR: 530               │
+│ Tools                      │ rotation: -0.012 deg                             │
+│   [k] Estimate K           │                                                  │
+│   [,] Settings             │                                                  │
+└────────────────────────────┴──────────────────────────────────────────────────┘
+[? for help]                                                                    
 ```
+
+Keystrokes are visible inline (e.g. `[s] START`). Tab moves focus between panes. Numeric fields editable inline.
+
+### Image window (matplotlib, side thread)
+
+A standalone matplotlib `TkAgg` window — single live-image axes — runs on its own thread and consumes a `queue.Queue[np.ndarray]` of recent guide images. Provides:
+
+- Full-resolution display (no character-grid downsampling).
+- ZScale stretch (configurable in TUI Settings).
+- Stamp ROIs drawn as overlays in their respective colors; **draggable to move/resize** via matplotlib's `RectangleSelector`.
+- Built-in zoom/pan/reset via the `NavigationToolbar2Tk` toolbar (mouse wheel, click-drag, home button).
+- Template thumbnail inset in the top-right corner.
+
+The window updates every guide-image event the worker emits (~0.5 Hz). It can be closed without affecting the TUI; reopen via the `[i]` key. If the user is on a remote SSH session without X forwarding, the TUI runs fully and the image window simply doesn't open (the TUI's status bar shows "image: unavailable, no display").
 
 ### State machine
 
-```
-IDLE ─ user draws stamp(s); no template yet ─►
-REFERENCE_PENDING ─ adjust stamp(s); a henNNNN.fits has arrived;
-                    click "Build Template" ─►
-REFERENCE_SET ─ template in memory; click "Start Guiding" ─►
-GUIDING ─ ALERTED auto-entered/exited on out-of-family ─►
-(STOP returns to REFERENCE_SET; PAUSE freezes commands without losing state)
-```
-
-Across-target operation: STOP → slew TCS manually → wait for the next
-`henNNNN.fits` (end of fresh first integration) → click "Build
-Template" → REFERENCE_PENDING with the same stamps still drawn.
+Same five states as before: IDLE → REFERENCE_PENDING → REFERENCE_SET → GUIDING (with ALERTED / PAUSED branches). Driven by user keystrokes and worker events.
 
 ### Watch directory
 
-Opens an OS-native folder picker (`tkinter.filedialog.askdirectory`) at
-startup if the previously-saved `archon_watch_dir` doesn't exist, and on demand
-via the **[Change…]** button in the status bar. The button is enabled in
-**every** state, including `GUIDING`.
-
-On change, regardless of starting state:
-
-1. Stop the `watchdog` observer.
-2. Clear the rolling SUTR buffer (no reads carry across).
-3. Discard the in-memory template (it was tied to the previous
-   directory's frames).
-4. Reset the out-of-family running statistics (median, MAD, warmup
-   counter) — same as on stale-frame timeout and target-switch.
-5. Restart the observer on the new path.
-6. Persist `archon_watch_dir` to `session.toml`.
-7. Transition the state machine: from any of `REFERENCE_SET`, `GUIDING`,
-   `ALERTED`, or `PAUSED`, the state drops to **`REFERENCE_PENDING`**;
-   from `IDLE`, it stays in `IDLE`. Stamp geometry is preserved
-   (detector-frame and not directory-bound). The user must click "Build
-   Template" on a fresh `henNNNN.fits` from the new directory to resume
-   guiding.
+`[c]hange` opens an inline textual file-picker (textual has a `DirectoryTree` widget). Same OS-native semantics for path completion. Stop the `watchdog` observer, clear the rolling SUTR buffer, restart on the new path, persist to `session.toml`.
 
 ### Settings dialog
 
-`ttk.Notebook` with tabs: **Loop**, **Quality**, **Reduction**, **Files**,
-**TCS**, **Display**. Maps directly onto the config sections in §8.
+Textual `Modal` over the main TUI. Tabbed via `Tabs` widget — same sections as before (Loop / Quality / Reduction / Files / TCS / Display). Same v1 hot-reload limitation (worker snapshots config at start; restart to apply loop/quality changes).
 
-### "Estimate K" tool
+### Estimate K dialog
 
-Opens a modal dialog. Runs a Monte Carlo simulator on the current
-template:
+Textual `Modal` running the Monte Carlo on a short-lived asyncio task (textual is asyncio-based). Result table rendered with textual's `DataTable`; RMS-vs-K plotted with plotext; Apply writes `reduction.K` to config.toml.
 
-1. Compute expected photoelectrons per pixel from the template (a
-   slope-fit `henNNNN.fits` already in memory) and
-   `detector.gain_e_per_dn`.
-2. For `K ∈ {1, 2, 3, 4, 5}`:
-    - Build 50 noisy realisations of a K-window difference image,
-      including Poisson shot noise and read-noise scaled by `√(2/K)`.
-    - Run each realisation through the same 2-D xcor + parabolic-peak
-      pipeline used for live guiding (against the same template).
-3. Display a table `K → RMS(dx_px), RMS(dy_px)` and recommend the
-   smallest K with RMS below a configurable threshold.
-4. Click **Apply** to update the running K (writes `reduction.K` in
-   `config.toml`).
+### Alert banner
+
+Textual `Static` widget colored by severity (yellow WARN / orange ALERT / red ERROR). Audio dispatch via `core.audio` exactly as before (no UI-framework-specific code there).
 
 ### Threading rules
 
-- All Tk widget mutation happens on the main thread, called from
-  `root.after(200, drain_queue)`.
-- The worker thread only puts events on the queue; never touches Tk objects.
-
-### Alerts banner
-
-Three severity levels surfacing just below the status bar:
-
-- **WARN** (yellow) — degraded but loop continues (e.g. TCS pacing throttle).
-- **ALERT** (orange) — out-of-family detected; commands suppressed; loop
-  self-recovering.
-- **ERROR** (red) — file watcher stalled / TCS disconnected / template
-  build failed. Requires user action.
+- Textual app on the main thread (asyncio).
+- Matplotlib image window on a side thread (`threading.Thread` running `matplotlib.pyplot.show()`).
+- Worker thread (existing) is unchanged; it pushes to two queues — one for textual measurements, one for matplotlib image frames.
 
 ### Audio alert when guiding stops
 
 Whenever guiding effectively stops — i.e., the state machine transitions
-into one of the conditions below — the GUI plays a short, gentle warning
+into one of the conditions below — the TUI plays a short, gentle warning
 sound:
 
 - **stale-frame timeout** (no new SUTRs within
@@ -951,9 +961,8 @@ sound:
   `display.audio_speak_alerts = false` (default `true`) while still
   keeping the warning sound.
 - **target switch — OBJECT-keyword-only change** (no pointing jump).
-  Soft signal: just a brief system beep (Tk `widget.bell()`), no spoken
-  phrase, no warning sound, no state change. See §4 "Target-switch
-  detection."
+  Soft signal: just a brief terminal bell (`\a`), no spoken phrase, no
+  warning sound, no state change. See §4 "Target-switch detection."
 - **out-of-order or repeated SUTR / backwards frame number**. The
   Archon reordered something — rare on a new system, but worth surfacing
   audibly. Plays the warning sound + a yellow `WARN` banner ("frame %d:
@@ -963,7 +972,7 @@ sound:
   see §4 "Sequential-order sanity checks."
 - **TCS disconnect** — guiding can't proceed because commands are not
   reaching the telescope.
-- **template build failure** — Build Template was clicked but the
+- **template build failure** — Build Template was pressed but the
   source frame couldn't produce a usable template (no `henNNNN.fits`
   has arrived yet, file open error, too few unmasked pixels in the
   stamp, or zero variance after sky subtraction).
@@ -973,19 +982,18 @@ sound:
   resume back to GUIDING.
 
 The sound is intentionally subtle — a short ping or "blip", not a klaxon.
-The intent is "hey, look at the screen," not "drop everything." On
-macOS the default sound is the system **Submarine** (or **Tink**)
-(`/System/Library/Sounds/`); on Linux the default falls back to Tk's
-`widget.bell()` until a configured sound file is available. The full
-file path can be overridden in config (`display.audio_alert_sound`),
-including pointing at a custom `.wav`. Audio alerts can be disabled
-entirely with `display.audio_alerts = false` (default `true`).
+On macOS the default sound is the system **Submarine** (or **Tink**)
+(`/System/Library/Sounds/`); on Linux the default falls back to the
+terminal bell until a configured sound file is available. The full file
+path can be overridden in config (`display.audio_alert_sound`), including
+pointing at a custom `.wav`. Audio alerts can be disabled entirely with
+`display.audio_alerts = false` (default `true`).
 
 The audio is played from a non-blocking subprocess (`afplay` on macOS,
-`paplay`/`aplay` on Linux) so a slow audio system never stalls the GUI
+`paplay`/`aplay` on Linux) so a slow audio system never stalls the TUI
 or the worker thread. The same applies to the speech subprocess (`say`
 or `espeak`). If a subprocess fails, we log a `WARNING` and fall back to
-`widget.bell()`; the alert banner is unaffected.
+the terminal bell; the alert banner is unaffected.
 
 No audio is played for routine state changes (operator-driven STOP /
 PAUSE / Build Template), to avoid alert fatigue.
@@ -998,7 +1006,7 @@ stdlib `logging`, two handlers:
 - **Rotating file** at `DEBUG` in `~/.henrietta_guider/logs/`, daily,
   30-day retention.
 
-Format: `2026-04-30T08:14:22.137Z INFO core.tcs_client: G50,99 sent
+Format: `2026-04-30T08:14:22.137Z INFO core.autoguider_server: G50,99 sent
 (RA=+2.50″, Dec=-0.05″)`
 
 What gets logged:
@@ -1019,7 +1027,7 @@ The log is the second source of truth after SQLite for debugging.
 
 ### Unit (`tests/unit/`, fast, no I/O, no GUI)
 
-- `tcs_client.encode_command`: tabular tests including ±2.50″, just-out-of-
+- `autoguider_server.encode_command`: tabular tests including ±2.50″, just-out-of-
   range, sub-step rounding. Round-trip against a Python re-implementation of
   the C++ parser to be sure the two agree on every value. Property test:
   `decode(encode(x)) == round(x / 0.05) * 0.05` for every `x` in

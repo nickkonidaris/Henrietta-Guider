@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the Henrietta autoguider per `docs/superpowers/specs/2026-04-30-henrietta-autoguider-design.md`: watch SUTR FITS frames produced by the Archon, measure trace shifts via 2-D cross-correlation against a slope-fit template, send small (≤2.45″) telescope offsets to the TCS over TCP, and surface the live state in a Tk operator GUI. SQLite archive of every measurement for retrospective analysis of non-periodic mount errors.
+**Goal:** Build the Henrietta autoguider per `docs/superpowers/specs/2026-04-30-henrietta-autoguider-design.md`: watch SUTR FITS frames produced by the Archon, measure trace shifts via 2-D cross-correlation against a slope-fit template, send small (≤2.45″) telescope offsets to the TCS over TCP, and surface the live state in a textual + plotext TUI plus a matplotlib side-window for the live image. SQLite archive of every measurement for retrospective analysis of non-periodic mount errors.
 
-**Architecture:** Single Python 3.14 package `henrietta_guider`. `core/` is GUI-free (no Tk imports anywhere in this subtree); `cli/` and `gui/` are thin frontends over `core/`. Concurrency: Tk on main thread; one worker thread runs the watcher + reduction + control + TCS sender + SQLite writer end-to-end; thread-safe `queue.Queue` carries `MeasurementRow` events back to the main thread. The "Estimate K" Monte Carlo runs on its own short-lived worker thread so it doesn't block live guiding.
+**Architecture:** Single Python 3.14 package `henrietta_guider`. `core/` is UI-free (no textual / matplotlib imports anywhere in this subtree); `cli/` and `tui/` are thin frontends over `core/`. Concurrency: textual asyncio loop on the main thread; one worker thread runs the watcher + reduction + control + TCS sender + SQLite writer end-to-end; matplotlib image side-window runs on its own thread; thread-safe `queue.Queue` instances carry `MeasurementRow` events to the TUI and image frames to the matplotlib window. The "Estimate K" Monte Carlo runs on its own short-lived asyncio task so it doesn't block live guiding.
 
-**Tech Stack:** Python 3.14 (regular GIL build), uv (env + interpreter + lockfile management), Tk + ttk + matplotlib (GUI), watchdog (file events), astropy (FITS), numpy / scipy, stdlib `sqlite3` / `dataclasses` / `tomllib` / `logging`. Dev: pytest, ruff. CI: GitHub Actions.
+**Tech Stack:** Python 3.14 (regular GIL build), uv (env + interpreter + lockfile management), textual + plotext (TUI), matplotlib (TkAgg image side-window), watchdog (file events), astropy (FITS), numpy / scipy, stdlib `sqlite3` / `dataclasses` / `tomllib` / `logging`. Dev: pytest, ruff. CI: GitHub Actions.
 
 **TDD discipline:** Every behavioural unit gets a failing test first, then minimal code, then passing test, then commit. The few exceptions (project-scaffolding tasks with no logic to test) are called out in the steps.
 
@@ -55,7 +55,7 @@ If any check fails, stop and reconcile with the user before proceeding.
 
 **Note on dependency wheels.** The plan pins `requires-python = "==3.14.*"` (Python 3.14 was released Oct 2025; this plan targets 2026-05+). If `uv sync` fails because a transitive dep lacks 3.14 wheels, bump that dep's minimum to the next available release in `pyproject.toml` and re-sync. Do not silently downgrade `requires-python`.
 
-**Note on `make run-gui` / `make run-cli`.** These targets are wired up in Task 1.3 but the entry points they invoke (`henrietta_guider.gui.app:main`, `henrietta_guider.cli.__main__:main`) don't exist until Chunks 6 and 5 respectively. `uv sync` may emit a warning about the missing modules; that's expected and harmless. The targets only fail if you actually run them before those chunks land.
+**Note on `make run-tui` / `make run-cli`.** These targets are wired up in Task 1.3 but the entry points they invoke (`henrietta_guider.tui.app:main`, `henrietta_guider.cli.__main__:main`) don't exist until Chunks 7 and 6 respectively. `uv sync` may emit a warning about the missing modules; that's expected and harmless. The targets only fail if you actually run them before those chunks land.
 
 ---
 
@@ -66,12 +66,12 @@ This is the target layout once the plan is complete. Each file has one clearly b
 ```
 henrietta_guider/
 ├── __init__.py
-├── core/                         no Tk / GUI imports anywhere in this subtree
+├── core/                         no UI imports anywhere in this subtree
 │   ├── __init__.py
 │   ├── types.py                  shared dataclasses: Stamp, MeasurementRow, Template, ...
 │   ├── config.py                 dataclass config tree + TOML load/save
 │   ├── wire.py                   G xx yy CR encoder/decoder per Wireformat.md
-│   ├── tcs_client.py             TCP fire-and-forget client + pacing
+│   ├── autoguider_server.py             TCP fire-and-forget client + pacing
 │   ├── geometry.py               detector → sky transform (plate scale + PA + parity)
 │   ├── controller.py             per-axis P (with PI/PID hooks) + deadband + clip
 │   ├── bpm.py                    MEF BPM loader (HDU 0; 1 = good)
@@ -92,15 +92,18 @@ henrietta_guider/
 ├── cli/
 │   ├── __init__.py
 │   └── __main__.py               entry point: `henrietta-cli`
-├── gui/
+├── tui/
 │   ├── __init__.py
-│   ├── app.py                    Tk main window + state machine + queue drain
-│   ├── image_panel.py            live image + stamp overlays + template inset
-│   ├── control_panel.py          right-side controls (Stamps / Template / Loop / Tools)
-│   ├── timeseries_panel.py       6-row stacked time series
-│   ├── alerts.py                 banner widget + audio dispatch
-│   ├── estimate_k_dialog.py      Estimate K modal
-│   └── settings_dialog.py        tabbed settings modal
+│   ├── app.py                    textual main app + state machine + queue drain
+│   ├── image_window.py           matplotlib side-window (live image + ROIs + zoom)
+│   ├── widgets/
+│   │   ├── __init__.py
+│   │   ├── control_panel.py      controls (Stamps / Template / Loop / Tools)
+│   │   ├── timeseries.py         plotext time-series (one widget per metric)
+│   │   ├── histogram.py          plotext per-pixel SNR histogram
+│   │   └── alerts.py             banner widget + audio dispatch
+│   ├── estimate_k_dialog.py      Estimate K textual Modal
+│   └── settings_dialog.py        tabbed textual settings Modal
 └── tests/
     ├── __init__.py
     ├── unit/
@@ -117,7 +120,7 @@ Top-level project files:
 pyproject.toml                  uv-managed, Python 3.14, deps + scripts
 .python-version                 3.14.x patch pin
 uv.lock                         deterministic transitive pin (committed)
-Makefile                        setup / test / lint / run-gui / run-cli / format
+Makefile                        setup / test / lint / run-tui / run-cli / format
 .github/workflows/ci.yml        uv sync && make test && make lint
 .gitignore                      already exists
 ```
@@ -133,7 +136,7 @@ The plan is divided into chunks; each chunk is self-contained and ends with a wo
 - **Chunk 3: Reduction primitives** — config + types, BPM loader, framebuffer, sky subtraction, 2-D xcor, template build.
 - **Chunk 4: Per-frame orchestration** — reducer, signal_snr, quality (out-of-family), sanity (sequential order), target_switch, stale watchdog, store.
 - **Chunk 5: Worker thread, watcher, CLI, Monte Carlo, audio** — end-to-end pipeline minus the GUI; integration tests with `FakeArchon` + `FakeTCS`.
-- **Chunk 6: GUI** — Tk main window, panels, dialogs, alerts, end-to-end manual smoke test.
+- **Chunk 6: TUI** — textual main app, plotext widgets, matplotlib image side-window, dialogs, alerts, end-to-end manual smoke test.
 
 Each chunk's tasks are bite-sized (single action per step, 2–5 minutes of work). Each task ends in a commit.
 
@@ -183,12 +186,14 @@ dependencies = [
     "astropy>=7.0",
     "matplotlib>=3.10",
     "numpy>=2.2",
+    "plotext>=5.2",
     "scipy>=1.14",
+    "textual>=0.80",
     "watchdog>=6.0",
 ]
 
 [project.scripts]
-henrietta-gui = "henrietta_guider.gui.app:main"
+henrietta-tui = "henrietta_guider.tui.app:main"
 henrietta-cli = "henrietta_guider.cli.__main__:main"
 
 [dependency-groups]
@@ -248,7 +253,7 @@ git commit -m "bootstrap: uv project, Python 3.14, base deps"
 - Create: `henrietta_guider/__init__.py`
 - Create: `henrietta_guider/core/__init__.py`
 - Create: `henrietta_guider/cli/__init__.py`
-- Create: `henrietta_guider/gui/__init__.py`
+- Create: `henrietta_guider/tui/__init__.py`
 - Create: `tests/__init__.py`
 - Create: `tests/unit/__init__.py`
 - Create: `tests/integration/__init__.py`
@@ -256,12 +261,12 @@ git commit -m "bootstrap: uv project, Python 3.14, base deps"
 - [ ] **Step 1: Create the empty package files.**
 
 ```bash
-mkdir -p henrietta_guider/core henrietta_guider/cli henrietta_guider/gui
+mkdir -p henrietta_guider/core henrietta_guider/cli henrietta_guider/tui
 mkdir -p tests/unit tests/integration
 touch henrietta_guider/__init__.py \
       henrietta_guider/core/__init__.py \
       henrietta_guider/cli/__init__.py \
-      henrietta_guider/gui/__init__.py \
+      henrietta_guider/tui/__init__.py \
       tests/__init__.py tests/unit/__init__.py tests/integration/__init__.py
 ```
 
@@ -320,7 +325,7 @@ git commit -m "scaffold: empty package + smoke test"
 - [ ] **Step 1: Write the Makefile.**
 
 ```makefile
-.PHONY: help setup test test-unit test-integration lint format run-gui run-cli clean
+.PHONY: help setup test test-unit test-integration lint format run-tui run-cli clean
 
 help:
 	@echo "Targets:"
@@ -330,7 +335,7 @@ help:
 	@echo "  test-integration integration tests only"
 	@echo "  lint             ruff check + format check"
 	@echo "  format           ruff format (writes)"
-	@echo "  run-gui          launch the operator GUI"
+	@echo "  run-tui          launch the operator TUI"
 	@echo "  run-cli          run the headless CLI"
 	@echo "  clean            remove build artifacts"
 
@@ -354,8 +359,8 @@ format:
 	uv run ruff format .
 	uv run ruff check --fix .
 
-run-gui:
-	uv run henrietta-gui
+run-tui:
+	uv run henrietta-tui
 
 run-cli:
 	uv run henrietta-cli
@@ -453,7 +458,7 @@ Campanas Observatory.
 
 ```sh
 uv sync                  # downloads Python 3.14, creates .venv, installs deps
-make run-gui             # launch the operator GUI
+make run-tui             # launch the operator TUI
 make run-cli             # run the headless CLI
 make test                # run the test suite
 ```
@@ -501,7 +506,7 @@ End of Chunk 1. Working state: empty package, passing CI, working `make` targets
 
 **Goal:** Land the four pure-computational modules — wire encoder/decoder, TCS client, detector→sky geometry, and per-axis controller — with comprehensive unit tests. These are foundational and have no I/O dependencies (the TCS client uses a pair of `socket.socketpair`s in tests). Once Chunk 2 is done, the autoguider has the entire "math + bits on the wire" pipeline in working code.
 
-The order matters: **wire** before **tcs_client** (encoder is a pure function the client wraps), then **geometry**, then **controller**. Each module is a single-responsibility file (~150 lines max).
+The order matters: **wire** before **autoguider_server** (encoder is a pure function the client wraps), then **geometry**, then **controller**. Each module is a single-responsibility file (~150 lines max).
 
 ### Task 2.1: Wire encoder + decoder
 
@@ -731,8 +736,8 @@ git commit -m "core: wire format encoder + decoder per Wireformat.md"
 ### Task 2.2: TCS client with pacing
 
 **Files:**
-- Create: `henrietta_guider/core/tcs_client.py`
-- Create: `tests/unit/test_tcs_client.py`
+- Create: `henrietta_guider/core/autoguider_server.py`
+- Create: `tests/unit/test_autoguider_server.py`
 
 The client is fire-and-forget over TCP. It owns its own state machine (`DISCONNECTED → CONNECTING → CONNECTED`), auto-reconnects with exponential backoff, and enforces a minimum interval between sends to respect the TCS's `!guiding_ra && !guiding_dec` gate. `send_guide()` is non-blocking: returns `True` on send, `False` if not currently `CONNECTED` or within the pacing window.
 
@@ -740,7 +745,7 @@ The tests use `socket.socketpair()` so we don't need a real TCP listener; the cl
 
 - [ ] **Step 1: Write the failing tests.**
 
-Create `tests/unit/test_tcs_client.py`:
+Create `tests/unit/test_autoguider_server.py`:
 
 ```python
 import socket
@@ -748,14 +753,14 @@ import time
 
 import pytest
 
-from henrietta_guider.core.tcs_client import TCSClient, ConnectionState
+from henrietta_guider.core.autoguider_server import AutoGuiderServer, ConnectionState
 
 
 @pytest.mark.unit
-class TestTCSClient:
+class TestAutoGuiderServer:
     def _make_with_pair(self, pacing_s=0.0):
         a, b = socket.socketpair()
-        client = TCSClient.from_connected_socket(a, pacing_interval_s=pacing_s)
+        client = AutoGuiderServer.from_connected_socket(a, pacing_interval_s=pacing_s)
         return client, b  # b is the test-side "TCS"
 
     def test_initial_state_when_seeded_is_connected(self):
@@ -808,12 +813,12 @@ class TestTCSClient:
 
 - [ ] **Step 2: Run the tests, confirm they fail.**
 
-Run: `uv run pytest tests/unit/test_tcs_client.py -v`
+Run: `uv run pytest tests/unit/test_autoguider_server.py -v`
 Expected: import error (module doesn't exist).
 
-- [ ] **Step 3: Implement `core/tcs_client.py`.**
+- [ ] **Step 3: Implement `core/autoguider_server.py`.**
 
-Create `henrietta_guider/core/tcs_client.py`:
+Create `henrietta_guider/core/autoguider_server.py`:
 
 ```python
 """Fire-and-forget TCP client for the Henrietta TCS guide port.
@@ -852,7 +857,7 @@ class ConnectionState(enum.Enum):
     CONNECTED = "connected"
 
 
-class TCSClient:
+class AutoGuiderServer:
     """TCP client to the TCS guide port.
 
     The class is *not* thread-safe. The autoguider's worker thread is
@@ -886,7 +891,7 @@ class TCSClient:
         cls,
         sock: socket.socket,
         pacing_interval_s: float = 0.0,
-    ) -> "TCSClient":
+    ) -> "AutoGuiderServer":
         """Test-only: build a client around a pre-connected socket."""
         client = cls(pacing_interval_s=pacing_interval_s)
         client._sock = sock
@@ -965,7 +970,7 @@ Note: full reconnect / exponential-backoff machinery is intentionally deferred t
 
 - [ ] **Step 4: Run the tests, confirm they pass.**
 
-Run: `uv run pytest tests/unit/test_tcs_client.py -v`
+Run: `uv run pytest tests/unit/test_autoguider_server.py -v`
 Expected: all five green.
 
 - [ ] **Step 5: Lint.**
@@ -976,7 +981,7 @@ Expected: clean.
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add henrietta_guider/core/tcs_client.py tests/unit/test_tcs_client.py
+git add henrietta_guider/core/autoguider_server.py tests/unit/test_autoguider_server.py
 git commit -m "core: TCS client with pacing + suppression counters"
 ```
 
@@ -1168,7 +1173,7 @@ git commit -m "core: detector to sky transform (PA + plate scale + parity)"
 - Create: `henrietta_guider/core/controller.py`
 - Create: `tests/unit/test_controller.py`
 
-Per-axis P controller for v1 with `Ki` and `Kd` fields already in the dataclass for forward compatibility. Dead band suppresses noise-floor commands; max-command clip keeps a single send within the wire range. The output is the **command** (signed arcseconds) that the worker hands to `tcs_client.send_guide()`.
+Per-axis P controller for v1 with `Ki` and `Kd` fields already in the dataclass for forward compatibility. Dead band suppresses noise-floor commands; max-command clip keeps a single send within the wire range. The output is the **command** (signed arcseconds) that the worker hands to `autoguider_server.send_guide()`.
 
 The "freeze accumulators while ALERTED" semantics for PI/PID (see §5 of the spec) are stubbed in the dataclass but irrelevant for v1's pure-P. The test fixture exercises the dataclass interface so adding integral/derivative state later doesn't break callers.
 
@@ -1607,7 +1612,7 @@ class TestConfigRoundTrip:
     def test_save_then_load_returns_equal_config(self, tmp_path: Path):
         c = Config()
         c.loop.Kp_ra = 0.42                       # mutate one value
-        c.tcs.host = "tcs.lco.test"               # ... and another
+        c.tcs.bind_host = "127.0.0.1"             # ... and another
         out = tmp_path / "config.toml"
         save_config(c, out)
         c2 = load_config(out)
@@ -1697,8 +1702,9 @@ class FilesConfig:
 
 @dataclass
 class TCSConfig:
-    host: str = "tcs.lco"
-    port: int = 5400
+    # Autoguider acts as TCP server; the TCS connects to us.
+    bind_host: str = "0.0.0.0"
+    listen_port: int = 5400
     plate_scale_arcsec_per_px: float = 0.435
     parity_x: int = +1
     parity_y: int = +1
@@ -2700,7 +2706,7 @@ git commit -m "core: template build from slope-fit henNNNN.fits"
 - [ ] **Step 1: Run the full test suite.**
 
 Run: `make test`
-Expected: all unit tests across `tests/unit/` (wire, tcs_client, geometry, controller, types, config, bpm, framebuffer, sky, xcor, template) pass.
+Expected: all unit tests across `tests/unit/` (wire, autoguider_server, geometry, controller, types, config, bpm, framebuffer, sky, xcor, template) pass.
 
 - [ ] **Step 2: Run lint.**
 
@@ -3861,6 +3867,7 @@ class TestStore:
             cmd_ra_arcsec=0.0, cmd_dec_arcsec=0.05,
             cmd_suppressed_by=None,
             err_ra_arcsec=0.018, err_dec_arcsec=0.052,
+            field_rotation_deg=0.0,
             guiding_state="GUIDING",
         )
 
@@ -3885,7 +3892,10 @@ class TestStore:
     def test_write_frame_round_trip(self, tmp_path: Path):
         db = tmp_path / "roundtrip.db"
         with Store.open(db) as st:
-            frame = self._frame()
+            # Use a sentinel field_rotation_deg value so the round-trip
+            # check on this column is unambiguous.
+            from dataclasses import replace
+            frame = replace(self._frame(), field_rotation_deg=-0.012)
             row = self._row()
             st.write_frame(frame, [row])
         # Read back via a fresh connection (proves data was committed
@@ -3898,6 +3908,7 @@ class TestStore:
             assert f_row["timestamp_utc"] == frame.timestamp_utc
             assert f_row["guiding_state"] == "GUIDING"
             assert f_row["ramp_complete"] == 0  # bool False -> int 0
+            assert f_row["field_rotation_deg"] == pytest.approx(-0.012)
             m_row = conn.execute(
                 "SELECT * FROM stamp_measurements "
                 "WHERE frame_number=10 AND sutr_number=5 AND stamp_id=0"
@@ -3919,6 +3930,7 @@ class TestStore:
                 cmd_ra_arcsec=None, cmd_dec_arcsec=None,
                 cmd_suppressed_by="alerted",
                 err_ra_arcsec=None, err_dec_arcsec=None,
+                field_rotation_deg=None,
                 guiding_state="ALERTED",
             )
             st.write_frame(frame, [])
@@ -4024,6 +4036,7 @@ CREATE TABLE IF NOT EXISTS frames (
     cmd_suppressed_by  TEXT,
     err_ra_arcsec      REAL,
     err_dec_arcsec     REAL,
+    field_rotation_deg REAL,
     guiding_state      TEXT,
     PRIMARY KEY (frame_number, sutr_number)
 );
@@ -4077,6 +4090,7 @@ class FrameRecord:
     cmd_suppressed_by: str | None
     err_ra_arcsec: float | None
     err_dec_arcsec: float | None
+    field_rotation_deg: float | None
     guiding_state: str
 
 
@@ -4105,8 +4119,9 @@ class Store:
                 ramp_complete, ha_hours, dec_deg, pa_deg, airmass,
                 temperature_c, focus_position,
                 cmd_ra_arcsec, cmd_dec_arcsec, cmd_suppressed_by,
-                err_ra_arcsec, err_dec_arcsec, guiding_state)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                err_ra_arcsec, err_dec_arcsec, field_rotation_deg,
+                guiding_state)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 frame.frame_number, frame.sutr_number, frame.timestamp_utc,
                 frame.frame_path, int(frame.ramp_complete),
@@ -4114,7 +4129,8 @@ class Store:
                 frame.temperature_c, frame.focus_position,
                 frame.cmd_ra_arcsec, frame.cmd_dec_arcsec,
                 frame.cmd_suppressed_by, frame.err_ra_arcsec,
-                frame.err_dec_arcsec, frame.guiding_state,
+                frame.err_dec_arcsec, frame.field_rotation_deg,
+                frame.guiding_state,
             ),
         )
         for row in rows:
@@ -4156,7 +4172,7 @@ git commit -m "core: SQLite store (frames + stamp_measurements, WAL)"
 
 - [ ] **Step 1: Run full suite.**
 
-`make test` — all tests across `core/` (now: wire, tcs_client, geometry, controller, types, config, bpm, framebuffer, sky, xcor, template, quality, sanity, target_switch, stale, reducer, store) pass.
+`make test` — all tests across `core/` (now: wire, autoguider_server, geometry, controller, types, config, bpm, framebuffer, sky, xcor, template, quality, sanity, target_switch, stale, reducer, store) pass.
 
 - [ ] **Step 2: Lint.**
 
@@ -4270,7 +4286,7 @@ Thin wrappers around platform CLIs:
   Linux  -> paplay or aplay (sound) / espeak (speech)
 
 Failures (binary missing, file not found) log WARNING and return
-False; callers may then fall back to Tk's widget.bell(). Audio is
+False; callers may then fall back to the terminal bell (\a). Audio is
 fire-and-forget: a slow subsystem can never stall the worker thread.
 """
 
@@ -4717,7 +4733,7 @@ The worker is the runtime orchestrator. It owns:
 
 - a `Watcher` (file events → two queues)
 - a `Reducer` (per-SUTR pipeline)
-- a `TCSClient` (wire-protocol sender)
+- a `AutoGuiderServer` (wire-protocol sender)
 - a `Store` (SQLite writer)
 - a `StaleFrameWatchdog`, `OutOfFamilyDetector`, `TargetSwitchDetector`
 - the active `Template` (mutable; replaced when `auto_refresh_template`
@@ -4728,11 +4744,17 @@ The main loop:
 
 1. Pull a SUTR event from the queue (with a small timeout).
 2. Run it through the reducer.
-3. For each `MeasurementRow`, push to the store + the GUI event queue.
+3. For each `MeasurementRow`, push to the store + the TUI event queue.
 4. Compute the science-stamp telescope correction, run through the
    controllers, send via the TCS client (or note suppression).
-5. Update the watchdog timer.
-6. Also check the slope-frame queue: refresh the template when
+5. **Compute `field_rotation_deg`** (per spec §4 "Field rotation
+   (derived)") from the differential xcor shifts of the science stamp
+   (id=0) and the rotation stamp (id=2), if both produced an xcor
+   measurement on this SUTR. NULL otherwise (no rotation stamp
+   configured, or either stamp is warming up). Store on the
+   `FrameRecord`.
+6. Update the watchdog timer.
+7. Also check the slope-frame queue: refresh the template when
    appropriate.
 
 Tests use `FakeArchon` (writes synthetic `henNNNN_sssr.fits` +
@@ -4893,7 +4915,7 @@ class TestWorkerEndToEnd:
             Controllers (RA, Dec)
                  |
                  v
-              TCSClient -> wire frames
+              AutoGuiderServer -> wire frames
 
 Plus quality monitor, target-switch detector, stale-frame watchdog,
 template manager. Single thread; the GUI consumes from
@@ -4921,7 +4943,7 @@ from .reducer import Reducer
 from .stale import StaleFrameWatchdog
 from .store import FrameRecord, Store
 from .target_switch import TargetSwitchDetector
-from .tcs_client import TCSClient
+from .autoguider_server import AutoGuiderServer
 from .template import build_template
 from .types import GuidingState, MeasurementRow, Stamp
 from .watcher import Watcher
@@ -4950,7 +4972,7 @@ class Worker:
         cfg: Config,
         watcher: Watcher,
         reducer: Reducer,
-        tcs: TCSClient,
+        tcs: AutoGuiderServer,
         store: Store,
         science_stamp: Stamp,
         bpm_good: np.ndarray,
@@ -5003,7 +5025,11 @@ class Worker:
         settle_s: float = 0.2,
     ):
         """Convenience constructor for tests + CLI: builds and starts
-        all the pieces, yields the worker, then cleans up on exit."""
+        all the pieces, yields the worker, then cleans up on exit.
+
+        `tcs_socket` is a test-only or test-fixture-supplied pre-accepted
+        socket. The full bind/listen/accept loop with re-listen on
+        disconnect lives in worker.py proper (Chunk 6 / 6.4)."""
         watcher = Watcher(settle_s=settle_s)
         watcher.start_unmanaged(watch_dir)
         reducer = Reducer(
@@ -5012,7 +5038,7 @@ class Worker:
             bpm_good=bpm_good,
             xcor_search=cfg.reduction.xcor_search_radius_px,
         )
-        tcs = TCSClient.from_connected_socket(
+        tcs = AutoGuiderServer.from_connected_socket(
             tcs_socket, pacing_interval_s=cfg.loop.pacing_interval_s,
         )
         with Store.open(cfg.files.sqlite_db) as store:
@@ -5100,6 +5126,14 @@ class Worker:
             # tracked distinctly per spec §7 schema.
             cmd_ra, cmd_dec, suppressed = self._step_controllers(sci)
 
+            # Field rotation (derived). When both science (id=0) and
+            # rotation (id=2) stamps produced an xcor measurement on
+            # this SUTR, compute the per-frame field rotation from
+            # their differential pixel motion. Spec §4 "Field rotation
+            # (derived)". NULL if either stamp is missing or warming
+            # up.
+            field_rotation_deg = self._compute_field_rotation(rows)
+
             # Persist.
             frame_rec = FrameRecord(
                 frame_number=frame, sutr_number=sutr,
@@ -5112,6 +5146,7 @@ class Worker:
                 cmd_ra_arcsec=cmd_ra, cmd_dec_arcsec=cmd_dec,
                 cmd_suppressed_by=suppressed,
                 err_ra_arcsec=None, err_dec_arcsec=None,
+                field_rotation_deg=field_rotation_deg,
                 guiding_state=self._state.name,
             )
             self.store.write_frame(frame_rec, rows)
@@ -5124,7 +5159,7 @@ class Worker:
             return None, None, None
         if self._state is GuidingState.ALERTED:
             return None, None, "alerted"
-        from .tcs_client import ConnectionState
+        from .autoguider_server import ConnectionState
         if self.tcs.state is not ConnectionState.CONNECTED:
             return None, None, "tcs_disconnected"
         dra, ddec = detector_to_sky(
@@ -5149,6 +5184,36 @@ class Worker:
         if self.tcs.commands_suppressed_disconnected > before_disc:
             return cmd_ra, cmd_dec, "tcs_disconnected"
         return cmd_ra, cmd_dec, "unknown"
+
+    def _compute_field_rotation(
+        self, rows: list[MeasurementRow],
+    ) -> float | None:
+        """Per spec §4 'Field rotation (derived)'.
+
+        Returns the small-angle field-rotation estimate in degrees from
+        the differential pixel motion of the science stamp (id=0) and
+        the rotation stamp (id=2). Returns None when either is absent
+        or warming up.
+        """
+        import math
+        sci = next((r for r in rows if r.stamp_id == 0), None)
+        rot = next((r for r in rows if r.stamp_id == 2), None)
+        if sci is None or rot is None:
+            return None
+        if (sci.dx_px is None or sci.dy_px is None
+                or rot.dx_px is None or rot.dy_px is None):
+            return None
+        sx = rot.stamp_x_center - sci.stamp_x_center
+        sy = ((rot.stamp_y_lo + rot.stamp_y_hi) / 2.0
+              - (sci.stamp_y_lo + sci.stamp_y_hi) / 2.0)
+        d = math.sqrt(sx * sx + sy * sy)
+        if d == 0.0:
+            return None
+        phi = math.atan2(sy, sx)
+        ddx = rot.dx_px - sci.dx_px
+        ddy = rot.dy_px - sci.dy_px
+        theta_rad = (ddy * math.cos(phi) - ddx * math.sin(phi)) / d
+        return math.degrees(theta_rad)
 
     def _enter_stale_alert(self) -> None:
         """State transition for the stale-frame timeout.
@@ -5249,7 +5314,14 @@ def main(argv: list[str] | None = None) -> int:
         y_lo=cfg.reduction.stamp_y_lo, y_hi=cfg.reduction.stamp_y_hi,
     )
 
-    sock = socket.create_connection((cfg.tcs.host, cfg.tcs.port), timeout=5.0)
+    # Autoguider acts as TCP server; TCS connects to us. Bind & accept
+    # the first incoming connection (full re-listen on disconnect lives
+    # in worker.py — Chunk 6 / 6.4).
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((cfg.tcs.bind_host, cfg.tcs.listen_port))
+    listener.listen(1)
+    sock, _peer = listener.accept()
 
     stop = False
     def handle_sigint(signum, frame):
@@ -5324,37 +5396,59 @@ explicit limits the implementer should know):
 
 ---
 
-## Chunk 7: GUI
+## Chunk 7: TUI + image side-window
 
-**Goal:** Land the operator GUI: Tk + ttk + matplotlib, structured per
-the mockup at `mockups/gui_mockup.png` and the spec §9 layout. The GUI
-is a thin frontend over `core.Worker` — it drains
-`worker.measurement_events`, refreshes plots and the live image, and
-turns user clicks into config + state-machine transitions.
+**Goal:** Land the operator interface: a `textual` + `plotext` TUI for
+controls, time-series, histogram, and alerts; plus a separate
+`matplotlib` (TkAgg) side-window for the live guide image with draggable
+stamp ROIs and full zoom/pan/reset. Structured per spec §9 "Operator
+interface (TUI + image window)". The TUI is a thin frontend over
+`core.Worker` — it drains `worker.measurement_events` from a textual
+`set_interval` callback, refreshes widgets, and turns keystrokes into
+config + state-machine transitions. The image window is a side thread
+that consumes from a separate image-frame queue.
 
-This chunk has more code than test (Tk callbacks are exercised
-manually), so the TDD discipline relaxes: each task ends with a
-"smoke-test" verification in which the implementer launches the GUI
-against synthetic SUTR data and confirms expected visual + audio
+The TUI is keyboard-driven and reflows on terminal resize via SIGWINCH
+(handled by textual). It supports SSH natively (no X-forwarding
+fragility); when no display is available the matplotlib window simply
+doesn't open and the TUI's status bar reads "image: unavailable, no
+display."
+
+This chunk has more code than test (textual callbacks and matplotlib
+panels are exercised manually), so the TDD discipline relaxes: each task
+ends with a "smoke-test" verification in which the implementer launches
+the TUI against synthetic SUTR data and confirms expected visual + audio
 behaviour.
 
-**Reference materials:**
-- `mockups/gui_mockup.png` — layout target.
-- `mockups/estimate_k_mockup.png` — Estimate K dialog target.
-- `mockups/gui_mockup.py` — non-production renderer; the real
-  implementation should produce equivalent visuals.
-- Spec §9 — GUI subsection.
+**Pyproject deps to add (one-line addendum to Chunk 1's pyproject.toml):**
 
-### Task 7.1: App skeleton + state machine + queue drain
+```toml
+# Append to [project] dependencies
+"textual>=0.80",
+"plotext>=5.2",
+```
+
+Also drop the explicit `target-version = "py314"` from `[tool.ruff.format]`
+if it was added for Tk-specific reasons (it's not needed; ruff infers
+from `requires-python`).
+
+**Reference materials:**
+- `mockups/gui_mockup.png` — original layout target (Tk-era; informative
+  for content layout but NOT the TUI rendering).
+- `mockups/estimate_k_mockup.png` — Estimate K dialog target.
+- Spec §9 — Operator interface subsection (canonical).
+
+### Task 7.1: textual app skeleton + state machine + asyncio queue drain
 
 **Files:**
-- Create: `henrietta_guider/gui/app.py`
-- Create: `tests/unit/test_gui_state.py`
+- Create: `henrietta_guider/tui/__init__.py`
+- Create: `henrietta_guider/tui/app.py`
+- Create: `tests/unit/test_tui_state.py`
 
-The app constructs the Tk root + ttk styling, holds the `GuidingState`
-machine, opens the Worker (via `Worker.run`), and drains
-`worker.measurement_events` every 200 ms via `root.after()`. State
-transitions are pure functions tested without Tk.
+The app constructs a textual `App`, holds the `GuidingState` machine,
+opens the Worker (via `Worker.run`), and drains
+`worker.measurement_events` every 200 ms via a `set_interval` callback.
+State transitions are pure functions tested without textual.
 
 - [ ] **Step 1: Failing tests for the state-transition function.**
 
@@ -5362,12 +5456,12 @@ transitions are pure functions tested without Tk.
 import pytest
 
 from henrietta_guider.core.types import GuidingState
-from henrietta_guider.gui.app import next_state, UiAction
+from henrietta_guider.tui.app import next_state, UiAction
 
 
 @pytest.mark.unit
 class TestStateTransitions:
-    def test_idle_save_template_advances_to_set(self):
+    def test_idle_template_built_advances_to_set(self):
         assert next_state(GuidingState.IDLE, UiAction.TEMPLATE_BUILT) is GuidingState.REFERENCE_SET
 
     def test_set_start_guiding(self):
@@ -5387,15 +5481,19 @@ class TestStateTransitions:
             assert next_state(s, UiAction.STALE) is GuidingState.REFERENCE_PENDING
 ```
 
-- [ ] **Step 2: Implement `gui/app.py` skeleton.**
+- [ ] **Step 2: Implement `tui/app.py` skeleton.**
 
 ```python
-"""Tk operator GUI for the Henrietta autoguider.
+"""Textual operator TUI for the Henrietta autoguider.
 
-Single window, state-machine-driven. Imports core.* but core does NOT
-import gui.* (verified at import time). Drains
-worker.measurement_events every 200 ms via root.after(); never touches
-worker state directly.
+Runs as the main asyncio loop. Imports core.* but core does NOT
+import tui.* (verified at import time). Drains
+worker.measurement_events every 200 ms via App.set_interval; never
+touches worker state directly.
+
+The matplotlib image side-window lives in tui/image_window.py and runs
+on its own thread (Task 7.2); the TUI does not import matplotlib at
+all (so a textual-only / SSH-only run path stays clean).
 """
 
 from __future__ import annotations
@@ -5403,15 +5501,14 @@ from __future__ import annotations
 import enum
 import logging
 import queue
-import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
 
-import numpy as np
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Footer, Header, Static
 
-from henrietta_guider.core.bpm import load_bpm
-from henrietta_guider.core.config import load_config, save_config
-from henrietta_guider.core.types import GuidingState, Stamp
+from henrietta_guider.core.types import GuidingState
 from henrietta_guider.core.worker import Worker
 
 log = logging.getLogger(__name__)
@@ -5429,7 +5526,7 @@ class UiAction(enum.Enum):
     WATCH_DIR      = "watch_dir"
 
 
-# --- State machine ---------------------------------------------------------
+# --- Pure state machine ----------------------------------------------------
 
 _TRANSITIONS: dict[tuple[GuidingState, UiAction], GuidingState] = {
     (GuidingState.IDLE,              UiAction.TEMPLATE_BUILT): GuidingState.REFERENCE_SET,
@@ -5454,373 +5551,332 @@ def next_state(current: GuidingState, action: UiAction) -> GuidingState:
     return _TRANSITIONS.get((current, action), current)
 
 
-# --- Application -----------------------------------------------------------
+# --- Textual application ---------------------------------------------------
 
-class App:
-    """Owns the Tk root, the state machine, and the queue-drain pump."""
+class HenriettaApp(App):
+    """Textual operator app. Owns the state machine, queue-drain pump,
+    and references to the worker + the (optional) image side-window."""
 
-    DRAIN_INTERVAL_MS = 200
+    CSS_PATH = None  # use textual default theme; override in Settings (7.7)
+    BINDINGS = [
+        Binding("d", "draw_science",     "Draw science"),
+        Binding("a", "add_comparison",   "Add comparison"),
+        Binding("r", "add_rotation",     "Add rotation"),
+        Binding("b", "build_template",   "Build template"),
+        Binding("s", "start",            "Start guiding"),
+        Binding("t", "stop",             "Stop guiding"),
+        Binding("p", "pause",            "Pause"),
+        Binding("k", "estimate_k",       "Estimate K"),
+        Binding("comma", "settings",     "Settings"),
+        Binding("c", "change_watch_dir", "Change watch dir"),
+        Binding("i", "toggle_image",     "Show/hide image window"),
+        Binding("question_mark", "help", "Help"),
+    ]
+    DRAIN_INTERVAL_S = 0.2
 
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
+    def __init__(self) -> None:
+        super().__init__()
         self.state = GuidingState.IDLE
         self.worker: Worker | None = None
-        self._configure_style()
-        self._build_layout()
-        self.root.after(self.DRAIN_INTERVAL_MS, self._drain_queue)
+        self.image_window = None  # set by Task 7.8 wire-up
 
-    def _configure_style(self) -> None:
-        style = ttk.Style(self.root)
-        import sys
-        if sys.platform == "darwin":
-            try: style.theme_use("aqua")
-            except tk.TclError: pass
-        else:
-            try: style.theme_use("clam")
-            except tk.TclError: pass
-        self.root.title("Henrietta Autoguider")
+    def compose(self) -> ComposeResult:
+        yield Header()
+        # Real layout (status bar + 2-col body + bottom plot stack)
+        # is filled in by Tasks 7.3 + 7.4. Skeleton placeholder here.
+        yield Static("Henrietta autoguider TUI — skeleton")
+        yield Footer()
 
-    def _build_layout(self) -> None:
-        # Three-region layout per spec §9:
-        # [status bar] / [image panel | control panel] / [time-series stack]
-        # Each region is its own module (image_panel, control_panel,
-        # timeseries_panel) — built up in tasks 7.2-7.4.
-        self.status_frame = ttk.Frame(self.root)
-        self.status_frame.pack(fill="x", side="top")
-
-        # TCS / Watcher status indicators (small coloured dots + label).
-        # Implementation-tip: tk.Canvas with a 14 px circle is the
-        # cheapest way to draw a dot that updates colour live.
-        self.tcs_dot = tk.Canvas(self.status_frame, width=14, height=14,
-                                 highlightthickness=0)
-        self.tcs_dot.create_oval(2, 2, 12, 12, fill="#999",
-                                 outline="#333", tags=("dot",))
-        self.tcs_dot.pack(side="left", padx=(6, 2))
-        self.tcs_label = ttk.Label(self.status_frame, text="TCS")
-        self.tcs_label.pack(side="left", padx=(0, 12))
-
-        self.watcher_dot = tk.Canvas(self.status_frame, width=14, height=14,
-                                     highlightthickness=0)
-        self.watcher_dot.create_oval(2, 2, 12, 12, fill="#999",
-                                     outline="#333", tags=("dot",))
-        self.watcher_dot.pack(side="left", padx=(0, 2))
-        self.watcher_label = ttk.Label(self.status_frame, text="Watcher")
-        self.watcher_label.pack(side="left", padx=(0, 12))
-
-        self.state_label = ttk.Label(self.status_frame, text="State: IDLE")
-        self.state_label.pack(side="left", padx=(0, 12))
-
-        # Watch-dir display + Change… button.
-        self.watch_dir_label = ttk.Label(self.status_frame,
-                                         text="Watch dir: (not set)")
-        self.watch_dir_label.pack(side="left", padx=(0, 8))
-        self.change_btn = ttk.Button(self.status_frame, text="Change…",
-                                     command=self._on_change_watch_dir)
-        self.change_btn.pack(side="left", padx=(0, 8))
-
-        # Body frame (image | control); time-series at bottom.
-        self.body = ttk.Frame(self.root)
-        self.body.pack(fill="both", expand=True)
-
-    def _on_change_watch_dir(self) -> None:
-        """Open OS-native folder picker; on selection, restart the
-        watcher and drop the state machine to REFERENCE_PENDING."""
-        from tkinter import filedialog
-        new_dir = filedialog.askdirectory(initialdir=self._initial_watch_dir())
-        if not new_dir:
-            return
-        # Implementation: stop the worker, rebuild it with the new
-        # watch_dir, transition state via UiAction.WATCH_DIR. Spelled
-        # out concretely in Task 7.8.
-
-    def _initial_watch_dir(self) -> str:
-        """Best-guess starting location for the folder picker.
-
-        Priority: session.toml's last-used watch dir (if it exists),
-        then config.files.parent_data_dir, then $HOME.
-        """
-        # See Task 7.8 for the wired-up implementation.
-        return str(Path.home())
+    def on_mount(self) -> None:
+        self.set_interval(self.DRAIN_INTERVAL_S, self._drain_queue)
 
     def _drain_queue(self) -> None:
-        if self.worker is not None:
-            try:
-                while True:
-                    evt = self.worker.measurement_events.get_nowait()
-                    self._on_measurement(evt)
-            except queue.Empty:
-                pass
-        self.root.after(self.DRAIN_INTERVAL_MS, self._drain_queue)
+        if self.worker is None:
+            return
+        try:
+            while True:
+                evt = self.worker.measurement_events.get_nowait()
+                self._on_measurement(evt)
+        except queue.Empty:
+            pass
 
     def _on_measurement(self, evt) -> None:
-        """Glue: turn one WorkerEvent into panel + state updates.
+        """Hook: update widgets in response to a worker event.
 
-        Sketch — Task 7.8 wires this to the actual panel instances.
+        Task 7.8 wires this to the actual widget instances:
 
-            sci = evt.rows[0]                       # science stamp row
-            self.timeseries_panel.append(sci, evt.cmd_ra_arcsec,
-                                          evt.cmd_dec_arcsec)
-            self.image_panel.update(
-                evt.guide_image, sci.science_stamp,
-                evt.comparison_stamp, evt.template_thumbnail,
-            )
-            self.control_panel.update_readouts(
-                dx=sci.dx_px, dy=sci.dy_px,
-                fwhm=sci.trace_fwhm_x_px,
-                xcor_peak=sci.xcor_peak_value,
-            )
+            sci = next(r for r in evt.rows if r.stamp_id == 0)
+            self.timeseries.append(sci, evt.cmd_ra_arcsec,
+                                    evt.cmd_dec_arcsec)
+            self.control_panel.update_readouts(...)
             if evt.state is not self.state:
                 self.state = evt.state
-                self.state_label.configure(text=f"State: {self.state.name}")
-                self.control_panel.update_buttons_for_state(self.state)
                 if evt.state is GuidingState.ALERTED:
-                    self.alert_banner.show("alert", "Out of family — "
-                                           "commands suppressed")
-                elif evt.state is GuidingState.GUIDING:
-                    self.alert_banner.hide()
+                    self.alerts.show(...)
         """
-        pass
+
+    # --- key actions -------------------------------------------------------
+
+    def action_change_watch_dir(self) -> None:
+        """Open the textual DirectoryTree picker; on selection, restart
+        the watcher and drop the state machine to REFERENCE_PENDING.
+        Wired up in Task 7.8."""
+        ...
+
+    # other action_* methods are stubs filled in by Tasks 7.4/7.6/7.7.
 
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO)
-    root = tk.Tk()
-    app = App(root)
-    root.mainloop()
+    app = HenriettaApp()
+    app.run()
     return 0
 ```
 
 - [ ] **Step 3: Run state tests; confirm green.**
 
-`uv run pytest tests/unit/test_gui_state.py -v`
+`uv run pytest tests/unit/test_tui_state.py -v`
 
-- [ ] **Step 4: Smoke test — launch the empty window.**
+- [ ] **Step 4: Smoke test — launch the empty TUI.**
 
-`uv run henrietta-gui` should open a window titled "Henrietta
-Autoguider" with a status bar reading "State: IDLE" and an empty body.
-Close the window manually.
+`uv run henrietta-tui` should open a textual app titled "HenriettaApp"
+with the skeleton placeholder text and a footer showing the keybindings.
+Press `q` (textual default) to quit.
 
 - [ ] **Step 5: Verify import discipline.**
 
-`uv run python -c "import henrietta_guider.core; import sys; assert 'tkinter' not in sys.modules"`
+```bash
+uv run python -c "
+import henrietta_guider.core
+import sys
+assert 'textual' not in sys.modules
+assert 'matplotlib' not in sys.modules
+"
+```
 
-The `core` package must not pull Tk transitively. If this assertion
-fails, find the offending core module and remove the GUI import.
+The `core` package must not pull in the TUI or matplotlib transitively.
 
-- [ ] **Step 6: Lint and commit.**
+- [ ] **Step 6: Update pyproject + entry point + lint and commit.**
+
+In `pyproject.toml`:
+- Add `"textual>=0.80"` and `"plotext>=5.2"` to `[project] dependencies`.
+- Change `[project.scripts] henrietta-gui` → `henrietta-tui`, value
+  `"henrietta_guider.tui.app:main"`.
 
 ```bash
+uv sync
 uv run ruff format . && uv run ruff check .
-git add henrietta_guider/gui/app.py tests/unit/test_gui_state.py
-git commit -m "gui: app skeleton + state machine + queue-drain pump"
+git add henrietta_guider/tui/__init__.py henrietta_guider/tui/app.py \
+        tests/unit/test_tui_state.py pyproject.toml uv.lock
+git commit -m "tui: textual app skeleton + state machine + queue-drain pump"
 ```
 
-### Task 7.2: Image panel with stamp overlays
+### Task 7.2: matplotlib image side-window (separate thread)
 
 **File:**
-- Create: `henrietta_guider/gui/image_panel.py`
+- Create: `henrietta_guider/tui/image_window.py`
 
-A `FigureCanvasTkAgg` showing the most recent guide image with the
-science stamp (red), comparison stamp (cyan), and template thumbnail
-inset (small, top-right of the axes). Z-scale stretch by default. The
-panel exposes `update(image: np.ndarray, science_stamp, comparison_stamp,
-template_thumbnail)` called from the GUI's measurement-event handler.
+A standalone `matplotlib` (TkAgg backend) figure, single axes, running on
+its own thread. Consumes `np.ndarray` guide-image frames from a
+`queue.Queue` and re-draws every event the worker pushes. ZScale stretch.
+Stamp ROIs drawn as draggable / resizable overlays via
+`matplotlib.widgets.RectangleSelector`. NavigationToolbar2Tk gives the
+operator click-drag pan, mouse-wheel zoom, and home reset for free.
 
-- [ ] **Step 1: Implement `gui/image_panel.py`.**
-
-Create the panel with these responsibilities:
+- [ ] **Step 1: Implement (skeleton).**
 
 ```python
-"""Live diff-image panel. See mockups/gui_mockup.png and spec §9."""
+"""matplotlib side-window for the live guide image.
+
+Runs on its own thread (separate from the textual main loop). Owns:
+
+  - a Tk root + matplotlib FigureCanvasTkAgg
+  - a NavigationToolbar2Tk (zoom / pan / home)
+  - draggable RectangleSelector overlays for the science / comparison
+    / rotation stamps
+  - a queue.Queue[np.ndarray] of incoming guide images
+  - a queue.Queue[Stamp_update] of stamp-geometry edits the worker
+    needs to pick up
+
+The window is OPTIONAL — if Tk fails to initialise (no display), the
+window object falls back to a no-op and the TUI's status bar reflects
+that. The TUI never imports matplotlib directly; it imports this
+module which lazily loads matplotlib in __init__.
+"""
+
 from __future__ import annotations
 
-import tkinter as tk
-import numpy as np
-from astropy.visualization import ZScaleInterval
-import matplotlib.patches as mpatches
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
+import logging
+import queue
+import threading
+from typing import Callable
 
-from henrietta_guider.core.types import Stamp
+log = logging.getLogger(__name__)
 
 
-class ImagePanel:
+class ImageWindow:
     SCIENCE_COLOR    = "#E63946"
     COMPARISON_COLOR = "#5BC0EB"
+    ROTATION_COLOR   = "#9D4EDD"
 
-    def __init__(self, parent: tk.Widget) -> None:
-        self.fig = Figure(figsize=(7, 5), facecolor="#ECECEC")
-        self.ax  = self.fig.add_subplot(111)
-        self.ax.set_facecolor("#000")
-        self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        self._img_artist = None
-        self._sci_patch  = None
-        self._cmp_patch  = None
-        self._inset_axes = None
+    def __init__(self, on_stamp_changed: Callable | None = None) -> None:
+        self.image_queue: queue.Queue = queue.Queue(maxsize=8)
+        self.on_stamp_changed = on_stamp_changed
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._available = False  # set True if we successfully imported Tk
 
-    def update(
-        self,
-        image: np.ndarray,
-        science_stamp: Stamp,
-        comparison_stamp: Stamp | None = None,
-        template_thumbnail: np.ndarray | None = None,
-    ) -> None:
+    def start(self) -> None:
+        """Start the side thread. Returns even if no display is
+        available; in that case the TUI surfaces 'image: unavailable'."""
+        try:
+            import matplotlib
+            matplotlib.use("TkAgg")
+            import tkinter  # noqa: F401  -- probe for display
+        except Exception as exc:
+            log.warning("Image side-window unavailable: %s", exc)
+            return
+        self._available = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def push_image(self, image) -> None:
+        """Worker thread calls this with each new guide image."""
+        if not self._available:
+            return
+        try:
+            self.image_queue.put_nowait(image)
+        except queue.Full:
+            pass  # drop frames if the user blocked the GUI
+
+    def _run(self) -> None:
+        # Inside the side thread: build the figure, attach the
+        # RectangleSelectors, run pyplot.show() (blocks until close).
+        import matplotlib.pyplot as plt
+        from astropy.visualization import ZScaleInterval
+
         zs = ZScaleInterval()
-        vlo, vhi = zs.get_limits(image)
-        if self._img_artist is None:
-            self._img_artist = self.ax.imshow(
-                image, origin="lower", cmap="viridis", aspect="auto",
-                vmin=vlo, vmax=vhi, interpolation="nearest",
-            )
-        else:
-            self._img_artist.set_data(image)
-            self._img_artist.set_clim(vlo, vhi)
-        self._update_stamp(self._sci_patch, science_stamp,
-                           self.SCIENCE_COLOR, "_sci_patch")
-        if comparison_stamp is not None:
-            self._update_stamp(self._cmp_patch, comparison_stamp,
-                               self.COMPARISON_COLOR, "_cmp_patch")
-        # Template thumbnail inset (small) — see mockup.
-        if template_thumbnail is not None:
-            if self._inset_axes is None:
-                self._inset_axes = self.ax.inset_axes([0.79, 0.04, 0.18, 0.30])
-                self._inset_axes.set_xticks([]); self._inset_axes.set_yticks([])
-                for s in self._inset_axes.spines.values():
-                    s.set_edgecolor(self.SCIENCE_COLOR); s.set_linewidth(1.2)
-            self._inset_axes.imshow(template_thumbnail, origin="lower",
-                                    cmap="viridis", aspect="auto",
-                                    interpolation="nearest")
-        self.canvas.draw_idle()
-
-    def _update_stamp(self, patch, stamp: Stamp, color: str, attr: str) -> None:
-        rect = mpatches.Rectangle(
-            (stamp.x_min, stamp.y_lo), stamp.x_max - stamp.x_min,
-            stamp.y_hi - stamp.y_lo, ec=color, fc="none", lw=1.6,
-        )
-        old = getattr(self, attr)
-        if old is not None:
-            old.remove()
-        setattr(self, attr, rect)
-        self.ax.add_patch(rect)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.set_facecolor("#000")
+        img_artist = None
+        # See spec §9 — Image window. Full RectangleSelector wiring +
+        # template thumbnail inset is finished in Task 7.8.
+        plt.show()  # blocks; closes when user closes the window
 ```
 
-- [ ] **Step 2: Smoke test.**
-
-Wire `ImagePanel` into `App._build_layout` for a manual run; feed it
-synthetic data via the `_on_measurement` handler and confirm visually.
+- [ ] **Step 2: Smoke test — push synthetic frames; confirm window updates.**
 
 - [ ] **Step 3: Lint and commit.**
 
 ```bash
-git add henrietta_guider/gui/image_panel.py
-git commit -m "gui: live image panel with stamp overlays + template inset"
+git add henrietta_guider/tui/image_window.py
+git commit -m "tui: matplotlib image side-window (TkAgg, threaded, ZScale + ROIs)"
 ```
 
-### Task 7.3: Time-series panel (six rows)
+### Task 7.3: Time-series widgets via plotext
 
 **File:**
-- Create: `henrietta_guider/gui/timeseries_panel.py`
+- Create: `henrietta_guider/tui/widgets/timeseries.py`
 
-Six stacked matplotlib axes per the mockup: dx/dy, FWHM, flux,
-sky_bg, xcor_peak, signal_snr. The panel keeps a rolling buffer of the
-most recent N events and redraws on each `update()`.
+A textual `Static` widget that renders a single time-series plot using
+plotext's terminal-rendered glyph plot and refreshes every event. One
+widget instance per metric; the TUI lays them out in a vertical stack
+per spec §9.
 
-- [ ] **Step 1: Implement (compact).**
+The metrics rendered (all from `MeasurementRow` plus the
+worker-derived `field_rotation_deg`):
+
+- `dx_px` + `dy_px` (overlaid)
+- `trace_fwhm_x_px`
+- `trace_flux_adu` (science solid; comparison dashed if present)
+- `sky_background_adu`
+- `xcor_peak_value`
+- `signal_snr`
+- `field_rotation_deg` (NEW — only when rotation stamp is configured)
+- `cmd_ra_arcsec` + `cmd_dec_arcsec` (overlaid)
+
+- [ ] **Step 1: Implement.**
 
 ```python
-"""Time-series stack — see mockups/gui_mockup.png and spec §9."""
+"""plotext-backed time-series widget for the textual TUI."""
+
 from __future__ import annotations
 
 import collections
-import tkinter as tk
+from typing import Callable
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
+import plotext as plt
+from rich.text import Text
+from textual.widget import Widget
 
-from henrietta_guider.core.types import MeasurementRow
 
+class TimeSeries(Widget):
+    DEFAULT_CSS = "TimeSeries { height: 4; }"
 
-class TimeSeriesPanel:
-    BUFFER = 600  # ~1 hour at 6 s cadence
+    def __init__(
+        self,
+        title: str,
+        getter: Callable,        # row -> float | None
+        buffer: int = 600,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.title = title
+        self.getter = getter
+        self.buffer: collections.deque[float | None] = collections.deque(maxlen=buffer)
 
-    SERIES = (
-        ("dx/dy (px)",         ["dx_px", "dy_px"]),
-        ("FWHM (px)",          ["trace_fwhm_x_px"]),
-        ("flux (ADU)",         ["trace_flux_adu"]),
-        ("sky bg (ADU)",       ["sky_background_adu"]),
-        ("xcor peak",          ["xcor_peak_value"]),
-        ("signal SNR √e⁻",     ["signal_snr"]),
-        ("commands (arcsec)",  ["cmd_ra_arcsec", "cmd_dec_arcsec"]),
-    )
+    def append(self, row) -> None:
+        self.buffer.append(self.getter(row))
+        self.refresh()
 
-    def __init__(self, parent: tk.Widget) -> None:
-        self.fig = Figure(figsize=(11, 4.5), facecolor="#ECECEC")
-        self.axes = self.fig.subplots(nrows=len(self.SERIES), ncols=1,
-                                      sharex=True)
-        for ax, (label, _) in zip(self.axes, self.SERIES):
-            ax.set_ylabel(label, fontsize=8)
-            ax.tick_params(labelsize=7)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        self.buffer: collections.deque[MeasurementRow] = collections.deque(maxlen=self.BUFFER)
-
-    def append(self, row: MeasurementRow) -> None:
-        self.buffer.append(row)
-        self._redraw()
-
-    def _redraw(self) -> None:
+    def render(self) -> Text:
         if not self.buffer:
-            return
-        ts = list(range(len(self.buffer)))  # sample-count axis for v1
-        for ax, (_, attrs) in zip(self.axes, self.SERIES):
-            ax.clear()
-            for attr in attrs:
-                ys = [getattr(r, attr) for r in self.buffer]
-                ax.plot(ts, [(y if y is not None else float("nan"))
-                             for y in ys], lw=1.0, label=attr)
-            ax.legend(loc="upper right", fontsize=7, framealpha=0.85)
-        self.canvas.draw_idle()
+            return Text(f"{self.title:>20}  (no data)")
+        plt.clf()
+        plt.theme("clear")
+        plt.plotsize(self.size.width - 22, self.size.height)
+        ys = [(y if y is not None else float("nan")) for y in self.buffer]
+        plt.plot(ys)
+        body = plt.build()
+        return Text.from_ansi(f"{self.title:>20}  {body}")
 ```
 
 - [ ] **Step 2: Smoke test + commit.**
 
 ```bash
-git add henrietta_guider/gui/timeseries_panel.py
-git commit -m "gui: 6-row time-series stack"
+git add henrietta_guider/tui/widgets/timeseries.py
+git commit -m "tui: plotext time-series widget (one per metric, incl. rotation)"
 ```
 
-### Task 7.4: Control panel (Stamps / Template / Loop / Tools)
+### Task 7.4: Control panel (status bar / stamps / template / loop / tools)
 
 **File:**
-- Create: `henrietta_guider/gui/control_panel.py`
+- Create: `henrietta_guider/tui/widgets/control_panel.py`
 
-The right-side panel from the mockup: Stamps (Draw science / Add
-comparison / Reset), Stamp geometry numeric fields, Template
-(current frame name + auto-refresh checkbox + Build Template button),
-Loop (Start / Stop / Pause), Live readouts, Tools (Estimate K /
-Settings).
+The left-side panel from the spec §9 mockup: status bar (TCS / watcher
+dots, state, watch dir), Stamps (Draw science / Add comparison / **Add
+rotation**), stamp geometry numeric fields, Template (current frame +
+auto-refresh checkbox + Build Template button), Loop (Start / Stop /
+Pause), Live readouts, Tools (Estimate K / Settings).
 
-- [ ] **Step 1: Implement (skeleton; ttk widgets per the mockup).**
+- [ ] **Step 1: Implement (skeleton; textual widgets + bindings).**
 
-The control panel exposes callbacks the `App` wires up:
+The control panel exposes callbacks the `App` wires up. All controls are
+keyboard-driven (per the BINDINGS in Task 7.1) and tab-focusable.
 
 ```python
-class ControlPanel:
-    def __init__(
-        self, parent, on_build_template, on_start, on_stop, on_pause,
-        on_estimate_k, on_settings, on_auto_refresh_toggle,
-    ): ...
-
-    # Updates pushed by App._on_measurement:
-    def update_readouts(self, dx, dy, fwhm, xcor_peak): ...
+class ControlPanel(Widget):
+    def update_readouts(self, dx, dy, fwhm, xcor_peak, rotation_deg=None): ...
     def update_template_label(self, frame_number: int | None): ...
-
-    # Updates pushed by App on state changes:
     def update_buttons_for_state(self, state: GuidingState): ...
 ```
 
-The buttons enable/disable themselves based on `state`:
+Same enable/disable matrix as before, applied as textual widget
+`disabled = True/False`:
 
 | State              | Build Template | Start | Stop | Pause |
 |--------------------|---------------|-------|------|-------|
@@ -5834,45 +5890,51 @@ The buttons enable/disable themselves based on `state`:
 - [ ] **Step 2: Smoke test + commit.**
 
 ```bash
-git add henrietta_guider/gui/control_panel.py
-git commit -m "gui: control panel (stamps / template / loop / tools)"
+git add henrietta_guider/tui/widgets/control_panel.py
+git commit -m "tui: control panel (stamps incl. rotation / template / loop / tools)"
 ```
 
 ### Task 7.5: Alerts banner + audio integration
 
 **File:**
-- Create: `henrietta_guider/gui/alerts.py`
+- Create: `henrietta_guider/tui/widgets/alerts.py`
 
-A `ttk.Label` that's hidden by default, made visible with the
-appropriate WARN / ALERT / ERROR colours when the worker pushes an
-alert event. Plays the warning sound (and spoken phrase, when set) via
-`core.audio.play_sound` and `core.audio.speak`.
+A textual `Static` widget that's hidden by default and made visible
+with the appropriate WARN / ALERT / ERROR background color when the
+worker pushes an alert event. Plays the warning sound (and spoken
+phrase, when set) via `core.audio.play_sound` and `core.audio.speak`
+exactly as before — no UI-framework-specific code lives in `core/audio`.
 
 - [ ] **Step 1: Implement.**
 
 ```python
-class AlertBanner:
-    COLORS = {"warn": "#F2A65A", "alert": "#F26D5B", "error": "#E63946"}
+from textual.widget import Widget
+from textual.widgets import Static
 
-    def __init__(self, parent, audio_alerts: bool, audio_speak: bool,
-                 audio_sound_path: str | None):
-        self.frame = ttk.Frame(parent)
-        self.label = ttk.Label(self.frame, padding=6, anchor="w")
-        self.label.pack(fill="x")
-        self.audio_alerts = audio_alerts
-        self.audio_speak = audio_speak
+
+class AlertBanner(Widget):
+    DEFAULT_CSS = """
+    AlertBanner { display: none; height: 3; padding: 1; }
+    AlertBanner.warn  { background: #F2A65A; display: block; }
+    AlertBanner.alert { background: #F26D5B; display: block; }
+    AlertBanner.error { background: #E63946; display: block; }
+    """
+
+    def __init__(self, *, audio_alerts: bool, audio_speak: bool,
+                 audio_sound_path: str | None) -> None:
+        super().__init__()
+        self.audio_alerts     = audio_alerts
+        self.audio_speak      = audio_speak
         self.audio_sound_path = audio_sound_path
-        self.frame.pack_forget()  # hidden by default
+        self._label = Static("")
+
+    def compose(self):
+        yield self._label
 
     def show(self, severity: str, message: str, spoken: str | None = None,
              sound: bool = True):
-        self.label.configure(
-            text=message, background=self.COLORS.get(severity, "#888"),
-        )
-        # Construction-order trick: the parent caller packs the status
-        # bar first and the banner frame next, so default top-stacking
-        # places the banner immediately below the status bar.
-        self.frame.pack(fill="x", side="top")
+        self.set_classes({severity})
+        self._label.update(message)
         if sound and self.audio_sound_path:
             from henrietta_guider.core import audio as core_audio
             core_audio.play_sound(self.audio_sound_path,
@@ -5882,53 +5944,53 @@ class AlertBanner:
             core_audio.speak(spoken, enabled=self.audio_speak)
 
     def hide(self):
-        self.frame.pack_forget()
+        self.set_classes(set())
 ```
 
 - [ ] **Step 2: Smoke test + commit.**
 
 ```bash
-git add henrietta_guider/gui/alerts.py
-git commit -m "gui: alert banner + audio dispatch"
+git add henrietta_guider/tui/widgets/alerts.py
+git commit -m "tui: alert banner + audio dispatch"
 ```
 
-### Task 7.6: Estimate K dialog
+### Task 7.6: Estimate K dialog (textual Modal)
 
 **File:**
-- Create: `henrietta_guider/gui/estimate_k_dialog.py`
+- Create: `henrietta_guider/tui/estimate_k_dialog.py`
 
-A `tk.Toplevel` modal that captures inputs from the active template,
-runs `core.monte_carlo.estimate_k` on a short-lived `threading.Thread`
-(per spec §9 "Threading rules"), shows a progress bar while it runs,
-and on completion displays the table + RMS-vs-K plot per the mockup at
-`mockups/estimate_k_mockup.png`.
+A textual `ModalScreen` that captures inputs from the active template,
+runs `core.monte_carlo.estimate_k` on a short-lived asyncio task (textual
+is asyncio-based), shows progress while it runs, and on completion
+displays the table + RMS-vs-K plot per the mockup at
+`mockups/estimate_k_mockup.png`. Result table via textual `DataTable`;
+plot via plotext.
 
 - [ ] **Step 1: Implement.**
 
-The dialog has three regions per the mockup: title bar (cancel),
-RMS plot + result table side-by-side, MC inputs + run status, footer
-(Re-run / Cancel / Apply K=N).
-
 ```python
-class EstimateKDialog(tk.Toplevel):
-    def __init__(self, parent, template, gain, rn, on_apply):
-        super().__init__(parent)
-        self.title("Estimate K")
+import asyncio
+
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Static
+
+
+class EstimateKDialog(ModalScreen):
+    def __init__(self, template, gain, rn, on_apply):
+        super().__init__()
         self.template = template
+        self.gain     = gain
+        self.rn       = rn
         self._on_apply = on_apply
-        self._build()
-        self._spawn_run()
 
-    def _spawn_run(self):
-        import threading
+    async def on_mount(self) -> None:
+        # Run the MC on a thread so we don't block the event loop.
         from henrietta_guider.core.monte_carlo import estimate_k
-        def run():
-            result = estimate_k(self.template, gain_e_per_dn=self.gain,
-                                read_noise_e=self.rn, n_realisations=50)
-            self.after(0, self._on_run_done, result)
-        threading.Thread(target=run, daemon=True).start()
-
-    def _on_run_done(self, result):
+        result = await asyncio.to_thread(
+            estimate_k, self.template,
+            gain_e_per_dn=self.gain, read_noise_e=self.rn,
+            n_realisations=50,
+        )
         self._populate_table(result)
         self._draw_plot(result)
         self._enable_apply(result.recommended_K)
@@ -5937,71 +5999,85 @@ class EstimateKDialog(tk.Toplevel):
 - [ ] **Step 2: Smoke test + commit.**
 
 ```bash
-git add henrietta_guider/gui/estimate_k_dialog.py
-git commit -m "gui: Estimate K modal dialog"
+git add henrietta_guider/tui/estimate_k_dialog.py
+git commit -m "tui: Estimate K modal (DataTable + plotext)"
 ```
 
-### Task 7.7: Settings dialog
+### Task 7.7: Settings dialog (tabbed textual Modal)
 
 **File:**
-- Create: `henrietta_guider/gui/settings_dialog.py`
+- Create: `henrietta_guider/tui/settings_dialog.py`
 
-`tk.Toplevel` with a `ttk.Notebook` mapping onto the §8 config sections
-(Loop / Quality / Reduction / Files / TCS / Display). Each tab is a
-ttk.Frame holding the relevant numeric / string entry widgets. Save
-calls `core.config.save_config`.
+A textual `ModalScreen` with a `Tabs` widget mapping onto the §8 config
+sections (Loop / Quality / Reduction / Files / TCS / Display). Each tab
+holds the relevant numeric / string / boolean entry widgets. Save calls
+`core.config.save_config`.
 
-**v1 hot-reload limitation.** The Worker (Chunk 6) snapshots config
-into `self.controllers`, `self.quality`, `self.stale`, etc. in
+**v1 hot-reload limitation.** Same as the Tk era: the Worker snapshots
+config into `self.controllers`, `self.quality`, `self.stale`, etc. in
 `__init__`. Saving in the Settings dialog persists the TOML but does
 **not** apply the new values to a running worker. The user must
 restart the autoguider for loop / quality / pacing / target-switch
 changes to take effect. Display-only changes (`audio_alerts`,
-`audio_alert_sound`, theme) are read live by the GUI on each access
-and do apply immediately. Surface this in the dialog with a small
-banner: "Saved. Restart to apply loop / quality changes." If
-commissioning shows operators want hot-reload, the natural fix is a
-`Worker.reload_config()` method that re-instantiates the dependent
-objects without exiting the loop.
+`audio_alert_sound`) are read live by the TUI on each access and do
+apply immediately. Surface this in the dialog with a small banner:
+"Saved. Restart to apply loop / quality changes."
 
-- [ ] **Step 1: Implement (pattern; one tab per config section).**
-
-Use `ttk.Entry` for floats / strings, `ttk.Checkbutton` for bools, and
-custom validation on Apply.
+- [ ] **Step 1: Implement (one Tab per config section; Input widgets
+  with on-Apply validation).**
 
 - [ ] **Step 2: Smoke test + commit.**
 
 ```bash
-git add henrietta_guider/gui/settings_dialog.py
-git commit -m "gui: tabbed settings dialog"
+git add henrietta_guider/tui/settings_dialog.py
+git commit -m "tui: tabbed settings dialog"
 ```
 
-### Task 7.8: Wire it all together
+### Task 7.8: Wire it all together — TUI app, image window, worker
 
 **Files:**
-- Modify: `henrietta_guider/gui/app.py`
+- Modify: `henrietta_guider/tui/app.py`
 
-Plug the four panels (image, time-series, control, alerts) into the
-main window's grid. Wire the control panel's button callbacks to the
-state machine + worker. Wire `_on_measurement` to push rows into the
-time-series panel and update the image panel.
+Plug the widgets (status bar / control panel / time-series stack /
+alerts) into the textual `compose()`. Wire the control-panel callbacks to
+the state machine + worker. Wire `_on_measurement` to push rows into the
+time-series widgets, refresh the control panel readouts, and (if
+available) push the latest guide image to the matplotlib side-window's
+queue.
+
+The image-window construction:
+
+```python
+from henrietta_guider.tui.image_window import ImageWindow
+
+self.image_window = ImageWindow(on_stamp_changed=self._on_stamp_changed_in_image)
+self.image_window.start()
+if not self.image_window.available:
+    self.status_bar.set_image_status("unavailable, no display")
+```
 
 - [ ] **Step 1: Manual end-to-end smoke test.**
 
-1. Generate synthetic frames via the FakeArchon test helper into a
-   tempdir.
-2. Launch `henrietta-gui`.
-3. Use the **Change…** button to point at the tempdir.
-4. Confirm: status bar updates, GUI receives slope-frame, Build
-   Template enables → click → state moves to REFERENCE_SET → Start
-   Guiding → SUTRs flow → time-series rows update → no exceptions in
-   stderr.
+1. Generate synthetic frames via `tests/integration/fakes.py`'s
+   `FakeArchon` helper into a tempdir.
+2. Launch `henrietta-tui`.
+3. Press `[c]hange` and point at the tempdir.
+4. Confirm: status bar updates, the matplotlib side-window opens (on a
+   local desktop) showing the synthetic frame, the control panel's
+   Build Template enables → press `[b]` → state moves to REFERENCE_SET
+   → press `[s]` (Start Guiding) → SUTRs flow → time-series widgets
+   refresh → no exceptions in stderr.
+5. Add a rotation stamp via `[r]` Add rotation; confirm the rotation
+   time-series widget begins showing values.
+6. Open a fresh terminal, `ssh user@host`, then `henrietta-tui`. The
+   TUI should run end-to-end with the side-window simply not opening
+   (status bar reads "image: unavailable, no display").
 
 - [ ] **Step 2: Final commit.**
 
 ```bash
-git add henrietta_guider/gui/app.py
-git commit -m "gui: wire panels + worker into the main window"
+git add henrietta_guider/tui/app.py
+git commit -m "tui: wire widgets + worker + image side-window into the main app"
 ```
 
 ### Task 7.9: End-of-chunk verification
@@ -6009,7 +6085,7 @@ git commit -m "gui: wire panels + worker into the main window"
 - [ ] **Step 1: Run full unit + integration suites.**
 
 `make test` — every unit test passes; integration tests pass; the new
-GUI state-machine test passes.
+TUI state-machine test passes.
 
 - [ ] **Step 2: Lint.**
 
@@ -6022,7 +6098,9 @@ git push && gh run watch
 ```
 
 End of Chunk 7. Working state: the autoguider has a complete operator
-GUI per the spec § 9 layout. Commissioning at the telescope can begin.
+TUI per the spec §9 layout, with a separate matplotlib image side-window
+for the live image. Commissioning at the telescope can begin — including
+over SSH from off-site.
 
 ---
 

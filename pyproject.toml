@@ -1,0 +1,60 @@
+[project]
+name = "henrietta-guider"
+version = "0.0.1"
+description = "Autoguider for the Henrietta IR spectrograph on Swope"
+readme = "README.md"
+requires-python = "==3.14.*"
+authors = [
+    { name = "Nick Konidaris", email = "nick.konidaris@gmail.com" },
+]
+dependencies = [
+    "astropy>=7.0",
+    "matplotlib>=3.10",
+    "numpy>=2.2",
+    "plotext>=5.2",
+    "scipy>=1.14",
+    "textual>=0.80",
+    "tomli-w>=1.0",
+    "watchdog>=6.0",
+]
+
+[project.scripts]
+henrietta-tui = "henrietta_guider.tui.app:main"
+henrietta-cli = "henrietta_guider.cli.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["henrietta_guider"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "unit: fast unit tests (no I/O, no GUI)",
+    "integration: end-to-end tests using FakeArchon + FakeTCS",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = ["mockups/", "experiments/"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "C4", "SIM", "TID"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
