@@ -45,6 +45,8 @@ class ControlPanel(Widget):
     ControlPanel { width: 40; padding: 1; }
     ControlPanel #status   { color: #93C5FD; }
     ControlPanel #readouts { color: #E5E7EB; }
+    ControlPanel #sky      { color: #E5E7EB; }
+    ControlPanel #pa       { color: #93C5FD; }
     ControlPanel #cmd      { color: #FBBF24; }
     """
 
@@ -53,6 +55,8 @@ class ControlPanel(Widget):
         self._status = Static("status: idle", id="status")
         self._template = Static("template: none", id="template")
         self._readouts = Static("dx --  dy --  fwhm --  xcor --", id="readouts")
+        self._sky_readouts = Static('dRA --"  dDec --"', id="sky")
+        self._pa_readout = Static("PA: --", id="pa")
         self._cmd = Static("cmd: --", id="cmd")
         self._btn_build = Button("Build Template", id="build")
         self._btn_start = Button("Start", id="start")
@@ -73,6 +77,8 @@ class ControlPanel(Widget):
             self._btn_pause,
             Static("─── Live ───"),
             self._readouts,
+            self._sky_readouts,
+            self._pa_readout,
             self._cmd,
             Static("─── Tools ───"),
             Static("[k] Estimate K   [,] Settings"),
@@ -88,13 +94,25 @@ class ControlPanel(Widget):
         xcor_peak: float | None,
         rotation_deg: float | None = None,
     ) -> None:
-        def f(x: float | None) -> str:
-            return f"{x:+.3f}" if x is not None else "  --"
+        def f2(x: float | None) -> str:
+            return f"{x:+.2f}" if x is not None else "  --"
 
-        line = f"dx {f(dx)}  dy {f(dy)}  fwhm {f(fwhm)}  xcor {f(xcor_peak)}"
+        line = f"dx {f2(dx)}px  dy {f2(dy)}px  fwhm {f2(fwhm)}px  xcor {f2(xcor_peak)}"
         if rotation_deg is not None:
             line += f"  rot {rotation_deg:+.4f}°"
         self._readouts.update(line)
+
+    def update_sky(
+        self,
+        dra_arcsec: float | None,
+        ddec_arcsec: float | None,
+        pa_deg: float | None,
+    ) -> None:
+        def f2(x: float | None, suffix: str = "") -> str:
+            return f"{x:+.2f}{suffix}" if x is not None else f"  --{suffix}"
+
+        self._sky_readouts.update(f"dRA {f2(dra_arcsec, chr(34))}  dDec {f2(ddec_arcsec, chr(34))}")
+        self._pa_readout.update(f"PA: {f2(pa_deg)}°" if pa_deg is not None else "PA: --")
 
     def update_command(
         self,

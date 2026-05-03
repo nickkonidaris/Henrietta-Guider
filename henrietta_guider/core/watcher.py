@@ -39,6 +39,12 @@ class Watcher:
         self._observer: Observer | None = None
         self._timers: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
+        # Snapshot of file basenames present in the watch dir at start
+        # time. macOS FSEvents will sometimes replay events for these on
+        # observer start; the SanityChecker downstream then trips on
+        # out-of-order frame numbers and discards everything. We ignore
+        # any path whose basename is in this snapshot.
+        self._preexisting: set[str] = set()
 
     @classmethod
     @contextmanager
@@ -55,11 +61,17 @@ class Watcher:
         """Start the underlying observer without a context manager.
 
         Public; used by Worker.run which wants to compose its own setup
-        and teardown around the watcher.
+        and teardown around the watcher. Snapshots pre-existing files
+        so FSEvents replays don't backflow stale frames into the queue.
         """
+        wd = Path(watch_dir).expanduser()
+        try:
+            self._preexisting = {p.name for p in wd.iterdir()}
+        except OSError:
+            self._preexisting = set()
         handler = _Handler(self)
         obs = Observer()
-        obs.schedule(handler, str(Path(watch_dir).expanduser()), recursive=False)
+        obs.schedule(handler, str(wd), recursive=False)
         obs.start()
         self._observer = obs
 
@@ -91,6 +103,15 @@ class Watcher:
         with self._lock:
             self._timers.pop(path, None)
         name = Path(path).name
+
+        # Skip files that were already in the watch dir at start time.
+        # FSEvents on macOS occasionally replays events for them during
+        # observer startup; processing those would drag stale frame
+        # numbers into the SanityChecker's state and cause every new
+        # frame to be discarded as "frame_backwards".
+        if name in self._preexisting:
+            log.debug("watcher: ignoring pre-existing file %s", name)
+            return
 
         m_sutr = _SUTR_RE.match(name)
         m_slope = _SLOPE_RE.match(name)

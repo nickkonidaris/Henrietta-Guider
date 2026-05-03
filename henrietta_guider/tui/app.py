@@ -272,6 +272,28 @@ class HenriettaApp(App):
             sci.xcor_peak_value,
             rotation_deg=self._latest_rotation,
         )
+        # Same xcor measurement, projected onto the sky frame using
+        # cfg.tcs.* — what the controller actually acts on.
+        dra_arc = ddec_arc = None
+        pa_deg = None
+        if self.cfg is not None:
+            pa_deg = self.cfg.tcs.pa_convention_offset_deg
+            if sci.dx_px is not None and sci.dy_px is not None:
+                from henrietta_guider.core.geometry import detector_to_sky
+
+                dra_arc, ddec_arc = detector_to_sky(
+                    sci.dx_px,
+                    sci.dy_px,
+                    self.cfg.tcs.plate_scale_arcsec_per_px,
+                    pa_deg,
+                    self.cfg.tcs.parity_x,
+                    self.cfg.tcs.parity_y,
+                )
+                # detector_to_sky returns the *correction* (= -drift).
+                # The readout shows drift, not correction, so flip back.
+                dra_arc = -dra_arc
+                ddec_arc = -ddec_arc
+        self._control_panel.update_sky(dra_arc, ddec_arc, pa_deg)
         self._control_panel.update_command(
             getattr(evt, "cmd_ra_arcsec", None),
             getattr(evt, "cmd_dec_arcsec", None),
@@ -302,11 +324,7 @@ class HenriettaApp(App):
         # running (e.g. user closed it).
         if sci.dx_px is not None:
             img = getattr(evt, "frame_image", None)
-            if (
-                img is not None
-                and self.image_window is not None
-                and self.image_window.available
-            ):
+            if img is not None and self.image_window is not None and self.image_window.available:
                 self.image_window.push_image(img)
 
     # --- demo feed (offline visual smoke) ------------------------------
