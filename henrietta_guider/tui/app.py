@@ -294,11 +294,20 @@ class HenriettaApp(App):
                 )
             elif prev is GuidingState.ALERTED:
                 self._alerts.hide()
-        # Push the latest raw frame to the matplotlib side-window.
-        # No-op when the subprocess isn't running (e.g. user closed it).
-        img = getattr(evt, "frame_image", None)
-        if img is not None and self.image_window is not None and self.image_window.available:
-            self.image_window.push_image(img)
+        # Push the latest K-window difference image to the matplotlib
+        # side-window. Skip during framebuffer warmup (sci.dx_px is None)
+        # because the worker falls back to raw_read in that case — and
+        # the reset frame is dim while subsequent diffs are bright, which
+        # looks like a frame dropout. No-op when the subprocess isn't
+        # running (e.g. user closed it).
+        if sci.dx_px is not None:
+            img = getattr(evt, "frame_image", None)
+            if (
+                img is not None
+                and self.image_window is not None
+                and self.image_window.available
+            ):
+                self.image_window.push_image(img)
 
     # --- demo feed (offline visual smoke) ------------------------------
 
