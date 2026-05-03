@@ -37,7 +37,7 @@ from .reducer import Reducer
 from .stale import StaleFrameWatchdog
 from .store import FrameRecord, Store
 from .target_switch import TargetSwitchDetector
-from .template import build_template
+from .template import Template, build_template
 from .types import GuidingState, MeasurementRow, Stamp
 from .watcher import Watcher
 
@@ -115,7 +115,18 @@ class Worker:
             threshold_arcsec=cfg.quality.target_switch_arcsec_threshold,
         )
         self.measurement_events: queue.Queue[WorkerEvent] = queue.Queue()
-        self._template = None  # set by Build Template flow
+        # Live stamp + per-stamp template state. Keyed by stamp_id:
+        #   0 = science  (drives RA/Dec corrections)
+        #   1 = comparison / reference (second drift monitor)
+        #   2 = rotation (drives field-rotation derivation)
+        # The science slot is seeded from the constructor's science_stamp;
+        # the others are added later via set_stamp() from the TUI's
+        # `:1 / :2 / :3` commands. Templates are rebuilt automatically
+        # whenever a stamp changes (if a slope file is in hand).
+        self._stamps: dict[int, Stamp] = {0: science_stamp}
+        self._templates: dict[int, Template] = {}
+        self._last_slope_path: str | None = None
+        self._stamps_lock = threading.Lock()
         self._state = GuidingState.IDLE
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -176,6 +187,40 @@ class Worker:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
 
+    # ---- public stamp API (called from the TUI thread) -----------------
+
+    def set_stamp(self, stamp_id: int, stamp: Stamp | None) -> None:
+        """Add, replace, or remove a stamp at the given id.
+
+        ``stamp_id`` follows the codebase convention:
+          0 = science, 1 = comparison/reference, 2 = rotation.
+        Pass ``stamp=None`` to remove the slot entirely. Templates are
+        rebuilt automatically when a slope file has already been
+        observed; otherwise the rebuild waits for the next slope file.
+        """
+        with self._stamps_lock:
+            if stamp is None:
+                self._stamps.pop(stamp_id, None)
+                self._templates.pop(stamp_id, None)
+                return
+            self._stamps[stamp_id] = stamp
+            self._templates.pop(stamp_id, None)  # invalidate old template
+            self._build_template_for_stamp_locked(stamp_id, stamp)
+
+    def _build_template_for_stamp_locked(self, stamp_id: int, stamp: Stamp) -> None:
+        """Caller must hold self._stamps_lock."""
+        if self._last_slope_path is None:
+            return
+        try:
+            self._templates[stamp_id] = build_template(self._last_slope_path, stamp, self.bpm_good)
+        except Exception as exc:
+            log.warning(
+                "template build failed for stamp %d (%s): %s",
+                stamp_id,
+                self._last_slope_path,
+                exc,
+            )
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             # Drain the slope queue first (cheaper, only updates the
@@ -198,20 +243,25 @@ class Worker:
             except queue.Empty:
                 continue
 
-            if self._template is None:
-                # Drop the SUTR; can't measure without a template yet.
+            # Snapshot the current stamp/template list under lock; the
+            # TUI may be calling set_stamp() concurrently.
+            with self._stamps_lock:
+                stamps_and_templates = [
+                    (self._stamps[sid], self._templates[sid], sid)
+                    for sid in sorted(self._stamps)
+                    if sid in self._templates
+                ]
+            if 0 not in {sid for _, _, sid in stamps_and_templates}:
+                # Need at least the science template to measure anything.
                 continue
 
-            stamps_and_templates = [
-                (self.science_stamp, self._template, 0),
-            ]
             rows = self.reducer.reduce_sutr(frame, sutr, raw_read, stamps_and_templates)
             if not rows:
                 continue
 
             self.stale.note_accepted(t_now=time.monotonic())
 
-            sci = rows[0]
+            sci = next((r for r in rows if r.stamp_id == 0), rows[0])
 
             # Quality check on the science stamp's metrics. Only run when
             # the reducer actually produced xcor/trace fields (i.e. the
@@ -285,9 +335,7 @@ class Worker:
             # Mask known-bad pixels with NaN for the operator's display.
             # matplotlib's colormap renders NaN with the "bad" color
             # (transparent), so dead/hot pixels stop drawing the eye.
-            display_image = np.where(self.bpm_good, display_source, np.nan).astype(
-                np.float32
-            )
+            display_image = np.where(self.bpm_good, display_source, np.nan).astype(np.float32)
             self.measurement_events.put(
                 WorkerEvent(
                     rows=rows,
@@ -378,7 +426,8 @@ class Worker:
             return
         log.error("Stale-frame timeout — guiding stopped, no frames received.")
         self._state = GuidingState.REFERENCE_PENDING
-        self._template = None
+        with self._stamps_lock:
+            self._templates.clear()
         self.quality = OutOfFamilyDetector(
             window=self.cfg.quality.out_of_family_window,
             warmup=self.cfg.quality.out_of_family_warmup_n,
@@ -387,14 +436,12 @@ class Worker:
         )
 
     def _maybe_refresh_template(self, frame_number: int, path: str) -> None:
-        if self._template is None or self.cfg.reduction.auto_refresh_template:
-            try:
-                self._template = build_template(
-                    path,
-                    self.science_stamp,
-                    self.bpm_good,
-                )
-                if self._state is GuidingState.IDLE:
-                    self._state = GuidingState.REFERENCE_SET
-            except Exception as exc:
-                log.warning("template build failed: %s", exc)
+        with self._stamps_lock:
+            self._last_slope_path = path
+            need_refresh = not self._templates or self.cfg.reduction.auto_refresh_template
+            if need_refresh:
+                for sid, stamp in list(self._stamps.items()):
+                    self._build_template_for_stamp_locked(sid, stamp)
+            have_science = 0 in self._templates
+        if have_science and self._state is GuidingState.IDLE:
+            self._state = GuidingState.REFERENCE_SET

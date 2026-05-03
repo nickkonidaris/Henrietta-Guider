@@ -216,6 +216,10 @@ class HenriettaApp(App):
     def _drain_queue(self) -> None:
         if self.worker is None and self._runtime is not None:
             self.worker = self._runtime.worker  # may still be None
+            if self.worker is not None:
+                # Worker just came up (TCS connected). Replay any
+                # operator-set stamps that landed before the connection.
+                self._sync_all_stamps_to_worker()
         if self.worker is None:
             return
         try:
@@ -482,6 +486,12 @@ class HenriettaApp(App):
 
         self.push_screen(CommandPrompt(), on_done)
 
+    # User-facing vi-stamp number ↔ internal Worker stamp_id.
+    #   :1 (science)   -> 0  (drives RA/Dec)
+    #   :2 (rotation)  -> 2  (drives field-rotation derivation)
+    #   :3 (reference) -> 1  (second drift monitor)
+    _VI_TO_STAMP_ID: dict[int, int] = {1: 0, 2: 2, 3: 1}
+
     def _handle_command(self, raw: str) -> None:
         result = parse_command(raw)
         if isinstance(result, ParseError):
@@ -495,10 +505,14 @@ class HenriettaApp(App):
                 if not self._stamps_by_n:
                     self.notify("no stamps to clear", severity="information")
                     return
+                vi_ns = list(self._stamps_by_n)
                 self._stamps_by_n.clear()
+                for vi in vi_ns:
+                    self._sync_stamp_to_worker(vi, None)
                 self.notify("cleared all stamps", severity="information")
             elif result.n in self._stamps_by_n:
                 del self._stamps_by_n[result.n]
+                self._sync_stamp_to_worker(result.n, None)
                 self.notify(
                     f"cleared {STAMP_LABELS[result.n]} stamp",
                     severity="information",
@@ -529,6 +543,7 @@ class HenriettaApp(App):
                 "label": STAMP_LABELS[result.n],
             }
             self._push_stamps_to_image()
+            self._sync_stamp_to_worker(result.n, self._stamps_by_n[result.n])
             self.notify(
                 f"{STAMP_LABELS[result.n]} stamp set: "
                 f"x∈[{result.x_min},{result.x_max}) "
@@ -541,6 +556,48 @@ class HenriettaApp(App):
             return
         stamps = [self._stamps_by_n[n] for n in sorted(self._stamps_by_n)]
         self.image_window.set_stamps(stamps)
+
+    def _sync_stamp_to_worker(self, vi_n: int, info: dict | None) -> None:
+        """Push the :N stamp into the running worker (or no-op if no
+        worker yet). info=None removes the stamp."""
+        if self.worker is None:
+            return
+        stamp_id = self._VI_TO_STAMP_ID[vi_n]
+        if info is None:
+            self.worker.set_stamp(stamp_id, None)
+            return
+        from henrietta_guider.core.types import Stamp
+
+        x_min = int(info["x_min"])
+        x_max = int(info["x_max"])
+        width = x_max - x_min
+        # Stamp's geometry requires odd width: x_max = x_center + halfw + 1.
+        # If the user gave an even width, expand x_max by 1 so we can
+        # represent it; warn so the operator knows what landed.
+        if width % 2 == 0:
+            width += 1
+            self.notify(
+                f"{STAMP_LABELS[vi_n]}: width was even; rounded x_max up by 1 to {x_min + width}",
+                severity="information",
+            )
+        x_halfwidth = width // 2
+        x_center = x_min + x_halfwidth
+        stamp = Stamp(
+            x_center=x_center,
+            x_halfwidth=x_halfwidth,
+            y_lo=int(info["y_lo"]),
+            y_hi=int(info["y_hi"]),
+        )
+        self.worker.set_stamp(stamp_id, stamp)
+
+    def _sync_all_stamps_to_worker(self) -> None:
+        """Replay the App's current stamp set onto the worker. Called
+        when the worker first becomes available (so commands typed
+        before TCS connection still take effect)."""
+        if self.worker is None:
+            return
+        for vi_n, info in self._stamps_by_n.items():
+            self._sync_stamp_to_worker(vi_n, info)
 
     def action_change_watch_dir(self) -> None:
         """Open the textual DirectoryTree picker; on selection, restart
