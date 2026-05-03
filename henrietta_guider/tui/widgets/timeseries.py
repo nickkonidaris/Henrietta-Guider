@@ -1,8 +1,14 @@
-"""plotext-backed time-series widget for the textual TUI."""
+"""plotext-backed time-series widget for the textual TUI.
+
+X axis is wall-clock seconds (relative to "now" = right edge); old
+samples roll off after `window_s`. Default window is 100 s so the
+trace doesn't keep marching as more samples accumulate.
+"""
 
 from __future__ import annotations
 
 import collections
+import time
 from collections.abc import Callable
 
 import plotext as plt
@@ -26,18 +32,26 @@ class TimeSeries(Widget):
         self,
         title: str,
         getter: Callable,  # row -> float | None
-        buffer: int = 600,
+        window_s: float = 100.0,
         ylim: tuple[float, float] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.title = title
         self.getter = getter
+        self.window_s = window_s
         self.ylim = ylim
-        self.buffer: collections.deque[float | None] = collections.deque(maxlen=buffer)
+        # Each entry is (monotonic-time, value-or-None). Trimmed each
+        # append so we never hold more than ~window_s seconds of data.
+        self.buffer: collections.deque[tuple[float, float | None]] = collections.deque()
 
     def append(self, row) -> None:
-        self.buffer.append(self.getter(row))
+        v = self.getter(row)
+        now = time.monotonic()
+        self.buffer.append((now, v))
+        cutoff = now - self.window_s
+        while self.buffer and self.buffer[0][0] < cutoff:
+            self.buffer.popleft()
         self.refresh()
 
     def render(self) -> Text:
@@ -54,6 +68,12 @@ class TimeSeries(Widget):
         plt.plotsize(self.size.width, self.size.height)
         if self.ylim is not None:
             plt.ylim(self.ylim[0], self.ylim[1])
-        ys = [(y if y is not None else float("nan")) for y in self.buffer]
-        plt.plot(ys)
+        # X = seconds ago (negative on the left, 0 on the right edge).
+        # Pinning the X range stops the trace from marching as samples
+        # accumulate.
+        now = time.monotonic()
+        xs = [t - now for t, _ in self.buffer]
+        ys = [(v if v is not None else float("nan")) for _, v in self.buffer]
+        plt.plot(xs, ys)
+        plt.xlim(-self.window_s, 0)
         return Text.from_ansi(plt.build())
