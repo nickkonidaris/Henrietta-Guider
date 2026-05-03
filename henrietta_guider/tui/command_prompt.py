@@ -111,10 +111,14 @@ class CommandPrompt(ModalScreen[str | None]):
     """Single-line input pinned to the bottom of the screen.
 
     Dismisses with the typed string on Enter (caller parses), or with
-    None on Escape.
+    None on Escape. Up/Down walk command history (most recent last).
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("up", "history_prev", show=False),
+        Binding("down", "history_next", show=False),
+    ]
 
     DEFAULT_CSS = """
     CommandPrompt {
@@ -134,6 +138,14 @@ class CommandPrompt(ModalScreen[str | None]):
     }
     """
 
+    def __init__(self, history: list[str] | None = None) -> None:
+        super().__init__()
+        # Caller passes a snapshot of the App's history (most recent
+        # last). _cursor=None means "at the live prompt"; stepping back
+        # with Up walks toward 0.
+        self._history: list[str] = list(history or [])
+        self._cursor: int | None = None
+
     def compose(self) -> ComposeResult:
         with Vertical(id="wrap"):
             yield Static(":N x_min y_lo x_max y_hi   |   :?  for help", id="hint")
@@ -147,6 +159,33 @@ class CommandPrompt(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    # --- history navigation -------------------------------------------
+
+    def action_history_prev(self) -> None:
+        if not self._history:
+            return
+        if self._cursor is None:
+            self._cursor = len(self._history) - 1
+        elif self._cursor > 0:
+            self._cursor -= 1
+        self._set_input(self._history[self._cursor])
+
+    def action_history_next(self) -> None:
+        if self._cursor is None:
+            return
+        if self._cursor < len(self._history) - 1:
+            self._cursor += 1
+            self._set_input(self._history[self._cursor])
+        else:
+            # Past the newest -> back to a blank live prompt.
+            self._cursor = None
+            self._set_input("")
+
+    def _set_input(self, value: str) -> None:
+        inp = self.query_one("#cmd", Input)
+        inp.value = value
+        inp.cursor_position = len(value)
 
 
 class CommandHelp(ModalScreen):

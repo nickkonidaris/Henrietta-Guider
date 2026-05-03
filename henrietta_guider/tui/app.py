@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import argparse
 import enum
+import json
 import logging
 import queue
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from textual.app import App, ComposeResult
@@ -55,6 +57,11 @@ from henrietta_guider.tui.widgets.timeseries import TimeSeries
 
 if TYPE_CHECKING:
     from henrietta_guider.runtime import AutoguiderRuntime
+
+
+STAMPS_PATH = Path("~/.henrietta_guider/stamps.json").expanduser()
+HISTORY_PATH = Path("~/.henrietta_guider/command_history.json").expanduser()
+HISTORY_MAX = 100
 
 log = logging.getLogger(__name__)
 
@@ -188,6 +195,12 @@ class HenriettaApp(App):
         # uses the science stamp it was constructed with). Mapping
         # n -> {x_min, y_lo, x_max, y_hi}.
         self._stamps_by_n: dict[int, dict] = {}
+        # Restore the operator's last stamp set, if any. Pushed to the
+        # image window in on_mount() and to the worker in _drain_queue
+        # once the runtime accepts a TCS connection.
+        self._load_stamps()
+        # Persistent command history for the vi prompt (Up/Down).
+        self._command_history: list[str] = self._load_command_history()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -493,9 +506,17 @@ class HenriettaApp(App):
         def on_done(value: str | None) -> None:
             if value is None:
                 return  # ESC
+            stripped = value.strip()
+            # Avoid back-to-back duplicates; trim to HISTORY_MAX.
+            if stripped and (
+                not self._command_history or self._command_history[-1] != stripped
+            ):
+                self._command_history.append(stripped)
+                self._command_history = self._command_history[-HISTORY_MAX:]
+                self._save_command_history()
             self._handle_command(value)
 
-        self.push_screen(CommandPrompt(), on_done)
+        self.push_screen(CommandPrompt(history=self._command_history), on_done)
 
     # User-facing vi-stamp number ↔ internal Worker stamp_id.
     #   :1 (science)   -> 0  (drives RA/Dec)
@@ -535,6 +556,7 @@ class HenriettaApp(App):
                 )
                 return
             self._push_stamps_to_image()
+            self._save_stamps()
             return
         if isinstance(result, SetStamp):
             if result.n in self._stamps_by_n:
@@ -555,6 +577,7 @@ class HenriettaApp(App):
             }
             self._push_stamps_to_image()
             self._sync_stamp_to_worker(result.n, self._stamps_by_n[result.n])
+            self._save_stamps()
             self.notify(
                 f"{STAMP_LABELS[result.n]} stamp set: "
                 f"x∈[{result.x_min},{result.x_max}) "
@@ -567,6 +590,77 @@ class HenriettaApp(App):
             return
         stamps = [self._stamps_by_n[n] for n in sorted(self._stamps_by_n)]
         self.image_window.set_stamps(stamps)
+
+    def _save_stamps(self) -> None:
+        """Persist the current stamp set so it survives a restart."""
+        try:
+            STAMPS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            out = {
+                str(n): {
+                    "x_min": int(info["x_min"]),
+                    "y_lo": int(info["y_lo"]),
+                    "x_max": int(info["x_max"]),
+                    "y_hi": int(info["y_hi"]),
+                }
+                for n, info in self._stamps_by_n.items()
+            }
+            STAMPS_PATH.write_text(json.dumps(out, indent=2))
+        except OSError as exc:
+            log.warning("could not save stamps to %s: %s", STAMPS_PATH, exc)
+
+    def _load_stamps(self) -> None:
+        """Restore the saved stamp set from disk into self._stamps_by_n.
+
+        Silent no-op if the file is missing, malformed, or unreadable —
+        the user always has the option to re-set boxes via :N commands.
+        """
+        if not STAMPS_PATH.exists():
+            return
+        try:
+            data = json.loads(STAMPS_PATH.read_text())
+        except (OSError, ValueError) as exc:
+            log.warning("could not load stamps from %s: %s", STAMPS_PATH, exc)
+            return
+        if not isinstance(data, dict):
+            return
+        for key, geom in data.items():
+            try:
+                n = int(key)
+            except TypeError, ValueError:
+                continue
+            if n not in STAMP_LABELS or not isinstance(geom, dict):
+                continue
+            try:
+                self._stamps_by_n[n] = {
+                    "id": n,
+                    "x_min": int(geom["x_min"]),
+                    "y_lo": int(geom["y_lo"]),
+                    "x_max": int(geom["x_max"]),
+                    "y_hi": int(geom["y_hi"]),
+                    "color": STAMP_COLORS[n],
+                    "label": STAMP_LABELS[n],
+                }
+            except KeyError, TypeError, ValueError:
+                continue
+
+    def _load_command_history(self) -> list[str]:
+        """Restore the vi-prompt history from disk (most recent last)."""
+        if not HISTORY_PATH.exists():
+            return []
+        try:
+            data = json.loads(HISTORY_PATH.read_text())
+        except OSError, ValueError:
+            return []
+        if not isinstance(data, list):
+            return []
+        return [str(s) for s in data if isinstance(s, str)][-HISTORY_MAX:]
+
+    def _save_command_history(self) -> None:
+        try:
+            HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            HISTORY_PATH.write_text(json.dumps(self._command_history))
+        except OSError as exc:
+            log.warning("could not save command history to %s: %s", HISTORY_PATH, exc)
 
     def _sync_stamp_to_worker(self, vi_n: int, info: dict | None) -> None:
         """Push the :N stamp into the running worker (or no-op if no
